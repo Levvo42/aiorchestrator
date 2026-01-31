@@ -1,28 +1,22 @@
 """
 dev/dev_command.py
 ------------------
-Implements the "Dev: <request>" command for development tasks.
+Correctness-first dev patching:
 
-Flow:
-1) Build local context bundle (tree + relevant files)
-2) DevPolicy decides author providers + judge provider
-3) Ask each author provider to produce a unified diff patch
-4) Ask judge provider to pick the best patch (returns JSON: patch_index + rationale)
-5) Show patch + rationale
-6) Ask user to apply (yes/no)
-7) Apply patch
-8) Validate (compile; tests if available)
+- Proposal step must be side-effect free (no memory writes).
+- Authors must output a unified diff ONLY.
+- We validate patches structurally before judging or applying.
+- Apply requires explicit user confirmation (handled in main.py).
+- After apply: compile + tests (if available).
 
-IMPORTANT:
-- Proposal must be side-effect free (no memory writes / no stats updates).
-- Only unified diffs are allowed to be applied.
-- Judge must output STRICT JSON:
-    {"patch_index": <int>, "rationale": "<short text>"}
+Judge contract (STRICT JSON):
+{"patch_index": <int>, "rationale": "<short text>"}
 """
 
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -33,15 +27,21 @@ from dev.patch_apply import apply_patches
 from dev.validate import py_compile_files, run_tests_if_available
 
 
-def _safe_json_load(s: str) -> Optional[dict]:
-    try:
-        return json.loads(s)
-    except Exception:
-        return None
+# ----------------------------
+# Patch parsing / validation
+# ----------------------------
+
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
+_DIFF_GIT_RE = re.compile(r"^diff --git a\/(.+) b\/(.+)$")
 
 
 def _strip_markdown_fences(text: str) -> str:
     t = (text or "").strip()
+
+    # Remove common accidental prompt echo
+    if t.startswith("> "):
+        t = t[2:].lstrip()
+
     if not t.startswith("```"):
         return t
 
@@ -53,15 +53,87 @@ def _strip_markdown_fences(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-def _looks_like_unified_diff(text: str) -> bool:
-    t = (text or "").strip()
+def _safe_json_load(s: str) -> Optional[dict]:
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+
+def _validate_unified_diff(diff_text: str) -> Tuple[bool, str]:
+    """
+    Structural validation to prevent 'corrupt patch' errors.
+
+    Rules:
+    - Must include at least one 'diff --git a/... b/...'
+    - For each diff --git block:
+        - Must contain '--- a/...' then '+++ b/...'
+        - Must contain at least one hunk header '@@ -.. +.. @@'
+    - No leading prompt garbage
+    """
+    t = (diff_text or "").strip()
     if not t:
-        return False
-    if "diff --git" in t:
-        return True
-    if t.startswith("--- ") and "\n+++ " in t:
-        return True
-    return False
+        return False, "Empty patch."
+
+    lines = t.splitlines()
+
+    # Reject obvious non-diff outputs early
+    if not any(l.startswith("diff --git ") for l in lines):
+        return False, "Patch missing 'diff --git' header."
+
+    i = 0
+    blocks = 0
+
+    while i < len(lines):
+        line = lines[i]
+
+        if line.startswith("diff --git "):
+            m = _DIFF_GIT_RE.match(line)
+            if not m:
+                return False, f"Malformed diff header: '{line}'"
+
+            blocks += 1
+            saw_minus = False
+            saw_plus = False
+            saw_hunk = False
+
+            i += 1
+            while i < len(lines) and not lines[i].startswith("diff --git "):
+                l = lines[i]
+
+                # allow metadata lines like: new file mode, deleted file mode, similar, rename from/to
+                if l.startswith("--- "):
+                    # must be exactly '--- a/path' or '--- /dev/null'
+                    if not (l.startswith("--- a/") or l.startswith("--- /dev/null")):
+                        return False, f"Malformed '---' line: '{l}'"
+                    saw_minus = True
+
+                if l.startswith("+++ "):
+                    # must be exactly '+++ b/path' or '+++ /dev/null'
+                    if not (l.startswith("+++ b/") or l.startswith("+++ /dev/null")):
+                        return False, f"Malformed '+++' line: '{l}'"
+                    saw_plus = True
+
+                if _HUNK_RE.match(l):
+                    saw_hunk = True
+
+                # A very common corruption is stray quotes or prose
+                # We don't reject '+'/'-' content lines, only obvious prose BEFORE headers.
+                i += 1
+
+            if not (saw_minus and saw_plus):
+                return False, "Missing '--- a/...' and/or '+++ b/...' in a diff block."
+            if not saw_hunk:
+                return False, "Missing hunk header '@@ -.. +.. @@' in a diff block."
+
+            continue
+
+        i += 1
+
+    if blocks == 0:
+        return False, "No diff blocks found."
+
+    return True, "OK"
 
 
 def _extract_patch_text(patch_item: Any) -> str:
@@ -73,10 +145,15 @@ def _extract_patch_text(patch_item: Any) -> str:
 def _choose_first_valid_patch(successful_patches: List[Any]) -> Tuple[str, str]:
     for item in successful_patches:
         patch_text = _strip_markdown_fences(_extract_patch_text(item))
-        if _looks_like_unified_diff(patch_text):
-            return patch_text, "Fallback: selected first candidate patch that looks like a unified diff."
-    return "", "Fallback: no candidate patch looked like a unified diff; no patch selected."
+        ok, _ = _validate_unified_diff(patch_text)
+        if ok:
+            return patch_text, "Fallback: selected first structurally valid unified diff."
+    return "", "Fallback: no candidate patch was a structurally valid unified diff."
 
+
+# ----------------------------
+# Provider selection helpers
+# ----------------------------
 
 def _git_head(repo_root: str) -> str:
     try:
@@ -94,38 +171,40 @@ def _git_head(repo_root: str) -> str:
     return "nogit"
 
 
-def _rewrite_to_dev_providers(selected: List[str], provider_map: Dict[str, Any]) -> List[str]:
+def _prefer_dev_providers(selected: List[str], provider_map: Dict[str, Any]) -> List[str]:
     """
-    If runtime has *_dev providers, rewrite base provider names to *_dev equivalents.
-    This avoids "Authors: []" when capabilities lists openai/claude but runtime only
-    exposes openai_dev/claude_dev.
+    If runtime has *_dev providers, map base providers to *_dev equivalents.
     """
     runtime = set(provider_map.keys())
-    has_any_dev = any(k.endswith("_dev") for k in runtime)
-    if not has_any_dev:
-        # No special rewriting needed; just filter to runtime-available.
+    has_dev = any(p.endswith("_dev") for p in runtime)
+
+    if not has_dev:
         return [p for p in selected if p in runtime]
 
-    rewritten: List[str] = []
-    for p in selected:
-        if p in runtime:
-            rewritten.append(p)
-            continue
-
-        dev_name = f"{p}_dev"
-        if dev_name in runtime:
-            rewritten.append(dev_name)
-            continue
-
-        # Some repos might name dev variants differently; last resort: skip.
-    # Deduplicate while preserving order
-    seen = set()
     out: List[str] = []
-    for p in rewritten:
-        if p not in seen:
+    for p in selected:
+        if p.endswith("_dev") and p in runtime:
             out.append(p)
+            continue
+        if p in runtime and not p.endswith("_dev"):
+            # If both exist, prefer _dev
+            dev = f"{p}_dev"
+            out.append(dev if dev in runtime else p)
+            continue
+        # Map base -> dev
+        dev = f"{p}_dev"
+        if dev in runtime:
+            out.append(dev)
+
+    # Deduplicate preserve order
+    seen = set()
+    uniq: List[str] = []
+    for p in out:
+        if p not in seen:
+            uniq.append(p)
             seen.add(p)
-    return out
+
+    return uniq
 
 
 def _best_available_judge(preferred: str, provider_map: Dict[str, Any]) -> str:
@@ -133,20 +212,23 @@ def _best_available_judge(preferred: str, provider_map: Dict[str, Any]) -> str:
     if not runtime:
         return ""
 
-    # Prefer rewriting to *_dev if present
-    has_any_dev = any(k.endswith("_dev") for k in runtime)
-    if has_any_dev:
-        if preferred in provider_map:
-            return preferred
-        if f"{preferred}_dev" in provider_map:
-            return f"{preferred}_dev"
-        # Prefer openai_dev if it exists
+    if preferred in provider_map:
+        return preferred
+
+    # Prefer dev judge if any dev providers exist
+    if any(p.endswith("_dev") for p in runtime):
+        dev_pref = f"{preferred}_dev"
+        if dev_pref in provider_map:
+            return dev_pref
         if "openai_dev" in provider_map:
             return "openai_dev"
 
-    # Otherwise use preferred if exists, else first
-    return preferred if preferred in provider_map else runtime[0]
+    return runtime[0]
 
+
+# ----------------------------
+# Public API
+# ----------------------------
 
 def run_dev_request(
     repo_root: str,
@@ -178,17 +260,15 @@ def run_dev_request(
         determinism_key=determinism_key,
     )
 
-    # Rewrite author providers to *_dev equivalents when applicable
-    decision.author_providers = _rewrite_to_dev_providers(decision.author_providers, provider_map)
+    # Prefer *_dev providers when available
+    decision.author_providers = _prefer_dev_providers(decision.author_providers, provider_map)
+    decision.judge_provider = _best_available_judge(decision.judge_provider, provider_map)
 
-    # Ensure we have at least one author; if policy picked none, fall back to any dev providers.
+    # Ensure we have authors
     if not decision.author_providers:
         runtime = sorted(provider_map.keys())
         devs = [p for p in runtime if p.endswith("_dev")]
         decision.author_providers = devs[:2] if devs else runtime[:2]
-
-    # Choose judge deterministically among available runtime providers
-    decision.judge_provider = _best_available_judge(decision.judge_provider, provider_map)
 
     # ----------------------------
     # 1) Generate candidate patches
@@ -211,7 +291,20 @@ def run_dev_request(
         try:
             patch_text = client.generate(author_prompt)
             patch_text = _strip_markdown_fences(patch_text)
+
+            ok, why = _validate_unified_diff(patch_text)
+            if not ok:
+                author_outputs.append(
+                    {
+                        "provider": provider_name,
+                        "success": False,
+                        "error": f"Rejected invalid diff: {why}",
+                    }
+                )
+                continue
+
             author_outputs.append({"provider": provider_name, "success": True, "patch": patch_text})
+
         except Exception as e:
             author_outputs.append({"provider": provider_name, "success": False, "error": str(e)})
 
@@ -255,14 +348,14 @@ def run_dev_request(
 
                 if isinstance(idx, int) and 0 <= idx < len(candidate_patch_texts):
                     candidate = _strip_markdown_fences(candidate_patch_texts[idx].strip())
-                    if _looks_like_unified_diff(candidate):
+                    ok, why = _validate_unified_diff(candidate)
+                    if ok:
                         chosen_patch = candidate
                         judge_ok = True
                     else:
                         chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
                         judge_rationale = (
-                            f"Judge selected patch_index={idx}, but it didn't look like a unified diff. "
-                            f"{fallback_reason}"
+                            f"Judge selected patch_index={idx} but patch was invalid ({why}). {fallback_reason}"
                         )
                 else:
                     chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
@@ -335,10 +428,11 @@ def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
         report["apply"]["error"] = "No patch available to apply."
         return report
 
-    if not _looks_like_unified_diff(patch):
+    ok, why = _validate_unified_diff(patch)
+    if not ok:
         report["apply"]["attempted"] = True
         report["apply"]["applied"] = False
-        report["apply"]["error"] = "Chosen patch did not look like a unified diff. Refusing to apply."
+        report["apply"]["error"] = f"Chosen patch invalid: {why}"
         return report
 
     report["apply"]["attempted"] = True
