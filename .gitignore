@@ -15,6 +15,7 @@ venv/
 .DS_Store
 .idea/
 *.iml
+.idea/workspace.xml
 
 # Secrets
 .env
