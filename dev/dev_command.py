@@ -3,19 +3,24 @@ dev/dev_command.py
 ------------------
 Developer loop for self-patching the repo.
 
-Correctness-first invariant (locked down here):
+Correctness-first invariant:
 - Self-patching must be reproducible from repo state.
 
-This file enforces:
-1) Repo must be clean BEFORE context is built.
-2) base_commit is pinned at start of run.
-3) Repo must be clean BEFORE apply.
-4) HEAD must still equal base_commit BEFORE apply.
-If any of these fail, we refuse to apply.
+Two-step flow (matches main.py):
+1) run_dev_request(...) proposes a patch (does NOT apply).
+2) apply_dev_patch(repo_root=".", report=...) applies only after user confirmation.
 
-Public API expected by main.py:
-- run_dev_request(...)
-- apply_dev_patch(...)
+Report schema returned by run_dev_request is designed to be consumed directly by main.py:
+- report["policy"]["mode"]
+- report["policy"]["author_providers"]
+- report["policy"]["judge_provider"]
+- report["policy"]["reason"]
+- report["judge"]["rationale"]
+- report["chosen_patch"]
+- report["base_commit"]
+
+apply_dev_patch mutates and returns the same report with:
+- report["apply"] filled with results
 """
 
 from __future__ import annotations
@@ -53,10 +58,7 @@ def _git_head(repo_root: str) -> str:
 
 
 def _git_is_clean(repo_root: str) -> Tuple[bool, str]:
-    """
-    Returns (is_clean, status_output).
-    status_output is the porcelain output if dirty, else "".
-    """
+    """Returns (is_clean, porcelain_output_if_dirty)."""
     result = subprocess.run(
         ["git", "status", "--porcelain"],
         cwd=repo_root,
@@ -89,129 +91,37 @@ def _require_head(repo_root: str, expected_head: str, phase: str) -> None:
 
 
 # -----------------------------
-# Patch parsing / selection
+# Patch text helpers
 # -----------------------------
 
 _DIFF_START_RE = re.compile(r"^(diff --git|---\s|\+\+\+\s|@@\s)", re.MULTILINE)
 
 
 def _strip_markdown_fences(text: str) -> str:
-    """
-    Remove surrounding ``` or ```diff fences if present.
-    Keeps inner content.
-    """
+    """Remove surrounding ``` fences (including ```diff) if present."""
     t = (text or "").strip()
     if t.startswith("```"):
-        # Remove first fence line (``` or ```diff etc)
         t = re.sub(r"^```[a-zA-Z]*\s*\n", "", t, count=1)
-        # Remove last fence
         t = re.sub(r"\n```$", "", t, count=1)
     return t.strip()
 
 
 def _looks_like_unified_diff(text: str) -> bool:
-    """
-    Quick heuristic: require at least one known diff marker.
-    """
-    if not text or not isinstance(text, str):
-        return False
-    return bool(_DIFF_START_RE.search(text))
-
-
-def _extract_patch_text(item: Dict[str, Any]) -> str:
-    """
-    Standardize reading patch text from author/judge outputs.
-    """
-    if "patch" in item and isinstance(item["patch"], str):
-        return item["patch"]
-    if "text" in item and isinstance(item["text"], str):
-        return item["text"]
-    if "output" in item and isinstance(item["output"], str):
-        return item["output"]
-    return ""
+    return bool(text) and isinstance(text, str) and bool(_DIFF_START_RE.search(text))
 
 
 def _choose_first_valid_patch(candidates: List[Dict[str, Any]]) -> Tuple[str, str]:
-    """
-    Fallback selection: return first candidate that looks like unified diff.
-    """
-    successful = [c for c in candidates if c.get("success") and c.get("patch")]
+    """Fallback: return first candidate patch that looks like a unified diff."""
+    successful = [c for c in candidates if c.get("success") and isinstance(c.get("patch"), str)]
     for item in successful:
-        patch_text = _strip_markdown_fences(_extract_patch_text(item))
+        patch_text = _strip_markdown_fences(item["patch"])
         if _looks_like_unified_diff(patch_text):
             return patch_text, "Fallback: selected first candidate patch that looks like a unified diff."
     return "", "Fallback: no candidate patch looked like a unified diff; no patch selected."
 
 
 # -----------------------------
-# Public function expected by main.py
-# -----------------------------
-
-def apply_dev_patch(repo_root: str, patch: str, base_commit: str) -> Dict[str, Any]:
-    """
-    Apply a chosen unified-diff patch with strict reproducibility guards.
-
-    Returns an 'apply' report dict:
-      {
-        attempted: bool,
-        applied: bool,
-        changed_files: [..],
-        validation_ok: bool,
-        validation_output: str,
-        error: str
-      }
-
-    This function enforces:
-    - clean tree pre-apply
-    - HEAD == base_commit pre-apply
-    - unified diff shape
-    """
-    report: Dict[str, Any] = {
-        "attempted": False,
-        "applied": False,
-        "changed_files": [],
-        "validation_ok": False,
-        "validation_output": "",
-        "error": "",
-    }
-
-    if not patch:
-        report["attempted"] = True
-        report["error"] = "No patch available to apply."
-        return report
-
-    if not _looks_like_unified_diff(patch):
-        report["attempted"] = True
-        report["error"] = "Chosen patch did not look like a unified diff. Refusing to apply."
-        return report
-
-    report["attempted"] = True
-
-    try:
-        # Invariant checks
-        _require_clean_tree(repo_root, phase="pre-apply")
-        _require_head(repo_root, base_commit, phase="pre-apply")
-
-        backups = apply_patches(repo_root=repo_root, diff_text=patch)
-        changed_files = list(backups.keys())
-
-        report["changed_files"] = changed_files
-        report["applied"] = True
-
-        ok, out = py_compile_files(repo_root=repo_root, changed_paths=changed_files)
-        report["validation_ok"] = ok
-        report["validation_output"] = out
-
-        return report
-
-    except Exception as e:
-        report["applied"] = False
-        report["error"] = str(e)
-        return report
-
-
-# -----------------------------
-# Main dev runner
+# Step 1: propose patch (no apply)
 # -----------------------------
 
 def run_dev_request(
@@ -221,47 +131,46 @@ def run_dev_request(
     memory: Any,
     provider_map: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Execute a dev request and return a report dict.
-
-    memory: MemoryStore object (used for settings/stats/logging)
-    provider_map: {"openai": OpenAIClient(), "claude": ClaudeClient(), ...}
-                  each must provide .generate(prompt) -> str
-    """
     repo_root = str(Path(repo_root).resolve())
 
     report: Dict[str, Any] = {
         "request": request,
         "base_commit": "",
-        "policy": {},
-        "authors": [],
-        "judge": {},
-        "selection": {},
-        "apply": {},
-    }
-
-    # ---- Lock invariant: reproducible from repo state ----
-    try:
-        _require_clean_tree(repo_root, phase="start")
-        base_commit = _git_head(repo_root)
-        report["base_commit"] = base_commit
-
-        _require_head(repo_root, base_commit, phase="pre-context")
-        _require_clean_tree(repo_root, phase="pre-context")
-        context = build_context_bundle(repo_root=repo_root, request=request)
-
-    except Exception as e:
-        report["apply"] = {
+        "policy": {
+            "mode": None,
+            "author_providers": [],
+            "judge_provider": None,
+            "reason": "",
+        },
+        "authors": [],  # list of {provider, success, patch|error}
+        "judge": {
+            "provider": None,
+            "success": False,
+            "rationale": "",
+        },
+        "chosen_patch": "",
+        "apply": {
             "attempted": False,
             "applied": False,
             "changed_files": [],
             "validation_ok": False,
             "validation_output": "",
-            "error": str(e),
-        }
-        return report
+            "error": "",
+        },
+    }
 
-    # Decide policy (authors + judge) locally
+    # Invariant: must start clean, and pin the base commit used for context + patch generation
+    _require_clean_tree(repo_root, phase="start")
+    base_commit = _git_head(repo_root)
+    report["base_commit"] = base_commit
+
+    _require_head(repo_root, base_commit, phase="pre-context")
+    _require_clean_tree(repo_root, phase="pre-context")
+
+    # Context (already filtered by dev/context.py)
+    context = build_context_bundle(repo_root=repo_root, request=request)
+
+    # Decide dev policy
     policy = DevPolicy(capabilities)
     provider_stats = memory.get_provider_stats()
 
@@ -275,19 +184,23 @@ def run_dev_request(
     }
 
     decision = policy.decide(provider_stats=provider_stats, settings=dev_settings)
+
+    author_providers = list(getattr(decision, "author_providers", []) or [])
+    judge_provider = getattr(decision, "judge_provider", None)
+    mode = getattr(decision, "mode", None)
+
     report["policy"] = {
-        "mode": getattr(decision, "mode", None),
-        "author_providers": getattr(decision, "author_providers", []),
-        "judge_provider": getattr(decision, "judge_provider", None),
+        "mode": mode,
+        "author_providers": author_providers,
+        "judge_provider": judge_provider,
+        "reason": "Policy decided providers and mode.",
     }
 
-    # ----------------------------
     # 1) Generate candidate patches
-    # ----------------------------
-    author_outputs: List[Dict[str, Any]] = []
     author_prompt = build_author_prompt(request=request, context=context)
+    author_outputs: List[Dict[str, Any]] = []
 
-    for provider_name in decision.author_providers:
+    for provider_name in author_providers:
         client = provider_map.get(provider_name)
         if not client:
             author_outputs.append(
@@ -300,8 +213,7 @@ def run_dev_request(
             continue
 
         try:
-            patch_text = client.generate(author_prompt)
-            patch_text = _strip_markdown_fences(patch_text)
+            patch_text = _strip_markdown_fences(client.generate(author_prompt))
             author_outputs.append({"provider": provider_name, "success": True, "patch": patch_text})
             memory.update_provider_stats(provider_name, success=True)
         except Exception as e:
@@ -310,57 +222,111 @@ def run_dev_request(
 
     report["authors"] = author_outputs
 
-    # ----------------------------
-    # 2) Judge / select best patch
-    # ----------------------------
-    judge_provider_name = getattr(decision, "judge_provider", None)
-    judge_client = provider_map.get(judge_provider_name) if judge_provider_name else None
-
+    # 2) Judge/select
     chosen_patch = ""
-    selection_reason = ""
+    rationale = ""
 
+    judge_client = provider_map.get(judge_provider) if judge_provider else None
     if judge_client:
         try:
             judge_prompt = build_judge_prompt(request=request, context=context, candidates=author_outputs)
-            judge_text = judge_client.generate(judge_prompt)
-            judge_text = _strip_markdown_fences(judge_text)
+            judge_text = _strip_markdown_fences(judge_client.generate(judge_prompt))
 
             if _looks_like_unified_diff(judge_text):
                 chosen_patch = judge_text
-                selection_reason = f"Judge({judge_provider_name}) returned a unified diff directly."
-                report["judge"] = {"success": True, "provider": judge_provider_name, "reason": selection_reason, "patch": chosen_patch}
+                rationale = f"Judge({judge_provider}) returned a unified diff directly."
             else:
-                chosen_patch, selection_reason = _choose_first_valid_patch(author_outputs)
-                report["judge"] = {
-                    "success": True,
-                    "provider": judge_provider_name,
-                    "reason": "Judge output was not a diff; used fallback selection.",
-                    "patch": chosen_patch,
-                }
+                chosen_patch, rationale = _choose_first_valid_patch(author_outputs)
 
-            memory.update_provider_stats(judge_provider_name, success=True)
+            report["judge"] = {
+                "provider": judge_provider,
+                "success": True,
+                "rationale": rationale,
+            }
+            memory.update_provider_stats(judge_provider, success=True)
 
         except Exception as e:
-            chosen_patch, selection_reason = _choose_first_valid_patch(author_outputs)
-            report["judge"] = {"success": False, "provider": judge_provider_name, "reason": str(e), "patch": chosen_patch}
-            memory.update_provider_stats(judge_provider_name, success=False)
+            chosen_patch, fallback_reason = _choose_first_valid_patch(author_outputs)
+            report["judge"] = {
+                "provider": judge_provider,
+                "success": False,
+                "rationale": f"Judge failed: {e}. {fallback_reason}",
+            }
+            memory.update_provider_stats(judge_provider, success=False)
     else:
-        chosen_patch, selection_reason = _choose_first_valid_patch(author_outputs)
+        chosen_patch, rationale = _choose_first_valid_patch(author_outputs)
         report["judge"] = {
+            "provider": judge_provider,
             "success": False,
-            "provider": judge_provider_name,
-            "reason": "No judge provider available; used fallback selection.",
-            "patch": chosen_patch,
+            "rationale": f"No judge provider available. {rationale}",
         }
 
-    report["selection"] = {"reason": selection_reason, "has_patch": bool(chosen_patch)}
-
-    # ----------------------------
-    # 3) Apply selected patch
-    # ----------------------------
-    report["apply"] = apply_dev_patch(
-        repo_root=repo_root,
-        patch=chosen_patch,
-        base_commit=base_commit,
-    )
+    report["chosen_patch"] = chosen_patch
     return report
+
+
+# -----------------------------
+# Step 2: apply patch (yes/no confirmation)
+# -----------------------------
+
+def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Apply the patch contained in report["chosen_patch"].
+
+    Mutates and returns 'report' by setting report["apply"] results.
+
+    Invariants enforced:
+    - repo must be clean pre-apply
+    - HEAD must equal report["base_commit"] pre-apply
+    """
+    repo_root = str(Path(repo_root).resolve())
+
+    # Ensure apply block exists
+    report.setdefault("apply", {})
+    report["apply"].setdefault("attempted", False)
+    report["apply"].setdefault("applied", False)
+    report["apply"].setdefault("changed_files", [])
+    report["apply"].setdefault("validation_ok", False)
+    report["apply"].setdefault("validation_output", "")
+    report["apply"].setdefault("error", "")
+
+    patch = report.get("chosen_patch", "") or ""
+    base_commit = report.get("base_commit", "") or ""
+
+    report["apply"]["attempted"] = True
+
+    if not patch:
+        report["apply"]["applied"] = False
+        report["apply"]["error"] = "No patch produced."
+        return report
+
+    if not _looks_like_unified_diff(patch):
+        report["apply"]["applied"] = False
+        report["apply"]["error"] = "Chosen patch did not look like a unified diff. Refusing to apply."
+        return report
+
+    if not base_commit:
+        report["apply"]["applied"] = False
+        report["apply"]["error"] = "Missing base_commit in report; cannot enforce reproducibility."
+        return report
+
+    try:
+        _require_clean_tree(repo_root, phase="pre-apply")
+        _require_head(repo_root, base_commit, phase="pre-apply")
+
+        backups = apply_patches(repo_root=repo_root, diff_text=patch)
+        changed_files = list(backups.keys())
+
+        report["apply"]["changed_files"] = changed_files
+        report["apply"]["applied"] = True
+
+        ok, out = py_compile_files(repo_root=repo_root, changed_paths=changed_files)
+        report["apply"]["validation_ok"] = ok
+        report["apply"]["validation_output"] = out
+
+        return report
+
+    except Exception as e:
+        report["apply"]["applied"] = False
+        report["apply"]["error"] = str(e)
+        return report

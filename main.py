@@ -9,13 +9,19 @@ You can type tasks, or commands like:
 - Set Judge Mode: auto
 - Set Judge Mode: fixed
 - Show Judge
+- Show Settings
+- Set Verbosity: full | normal | final
+- Dev: <describe the change you want>
 """
+
 from __future__ import annotations
-from dotenv import load_dotenv
-load_dotenv()
+
 import json
 from pathlib import Path
 from typing import Optional
+
+from dotenv import load_dotenv
+
 from core.agent import Agent
 from core.memory import MemoryStore
 from dev.dev_command import run_dev_request, apply_dev_patch
@@ -28,25 +34,51 @@ def load_capabilities(path: str = "core/capabilities.json") -> dict:
 
 
 def normalize_provider_name(name: str) -> str:
-    """
-    Normalize user-friendly input to internal provider keys.
-    Example: 'OpenAI' -> 'openai'
-    """
+    """Normalize user-friendly input to internal provider keys."""
     return name.strip().lower()
 
 
 def handle_command(text: str, memory: MemoryStore) -> Optional[str]:
     """
-    Handle console commands that change judge settings.
-    Returns a user-friendly message if a command was handled, otherwise None.
+    Handle console commands that change settings.
+    Returns a message if handled, otherwise None.
     """
     t = text.strip()
+
+    if t.lower() == "help":
+        return (
+            "Commands:\n"
+            "  help\n"
+            "  show settings\n"
+            "  show judge\n"
+            "  set judge mode: auto | fixed\n"
+            "  set judge: <provider>\n"
+            "  judge with <provider>\n"
+            "  set verbosity: full | normal | final\n"
+            "\n"
+            "Dev workflow:\n"
+            "  dev: <request>\n"
+            "  (then answer 'yes' to apply or 'no' to cancel)\n"
+            "\n"
+            "Dev settings:\n"
+            "  show dev settings\n"
+            "  set dev mode: auto | fixed\n"
+            "  set dev judge: <provider>\n"
+            "  set dev authors: a, b, c\n"
+            "\n"
+            "Examples:\n"
+            "  set judge: gemini\n"
+            "  set judge mode: auto\n"
+            "  set verbosity: final\n"
+            "  dev: improve the help text for clarity\n"
+        )
+
     if t.lower() == "show dev settings":
         cfg = memory.state.get("settings", {})
         lines = ["Dev settings:"]
         keys = [
             "dev_mode", "dev_authors", "dev_judge_provider",
-            "dev_min_authors", "dev_max_authors", "dev_exploration_rate"
+            "dev_min_authors", "dev_max_authors", "dev_exploration_rate",
         ]
         for k in keys:
             lines.append(f"- {k}: {cfg.get(k)}")
@@ -66,71 +98,39 @@ def handle_command(text: str, memory: MemoryStore) -> Optional[str]:
 
     if t.lower().startswith("set dev authors:"):
         raw = t.split(":", 1)[1].strip()
-        # Accept comma-separated list
         authors = [a.strip().lower() for a in raw.split(",") if a.strip()]
         memory.set_setting("dev_authors", authors if authors else None)
         return f"Dev authors set to: {authors}"
 
-    if t.lower() == "help":
-        return (
-            "Available commands:\n"
-            "- Help\n"
-            "- Show Settings\n"
-            "- Show Judge\n"
-            "- Set Judge: <provider>\n"
-            "- Set Judge Mode: auto | fixed\n"
-            "- Set Verbosity: full | normal | final\n"
-            "\nExamples:\n"
-            "  Set Judge: gemini\n"
-            "  Set Verbosity: final\n"
-            "  Dev: < request >\n"
-
-            " Show Dev Settings \n"
-            " Set Dev Mode: auto | fixed \n"
-            " Set Dev Judge: < provider > \n"
-            " Set Dev Authors: a, b, c \n"
-        )
-
-    # Show current judge configuration
     if t.lower() == "show judge":
         cfg = memory.get_judge_config()
         return f"Judge mode: {cfg['judge_mode']}, Judge provider: {cfg['judge_provider']}"
 
-    # Set Judge Mode: auto/fixed
     if t.lower().startswith("set judge mode:"):
         mode = t.split(":", 1)[1].strip().lower()
         if mode not in ("auto", "fixed"):
             return "Invalid judge mode. Use: Set Judge Mode: auto  OR  Set Judge Mode: fixed"
-
         memory.set_setting("judge_mode", mode)
-
-        # If switching to auto, we can clear fixed provider to avoid confusion
         if mode == "auto":
             memory.set_setting("judge_provider", None)
-
         return f"Judge mode set to: {mode}"
 
-    # Set Judge: provider_name (puts mode into fixed)
     if t.lower().startswith("set judge:"):
         provider = normalize_provider_name(t.split(":", 1)[1])
         if not provider:
             return "Usage: Set Judge: openai  OR  Set Judge: gemini"
-
         memory.set_setting("judge_mode", "fixed")
         memory.set_setting("judge_provider", provider)
         return f"Judge set to: {provider} (mode=fixed)"
 
-    # Friendly alternative: "Judge with OpenAI"
     if t.lower().startswith("judge with "):
         provider = normalize_provider_name(t[len("judge with "):])
         if not provider:
             return "Usage: Judge with openai  OR  Judge with gemini"
-
         memory.set_setting("judge_mode", "fixed")
         memory.set_setting("judge_provider", provider)
         return f"Judge set to: {provider} (mode=fixed)"
 
-    # Show all settings
     if t.lower() == "show settings":
         cfg = memory.state.get("settings", {})
         lines = ["Current settings:"]
@@ -138,40 +138,26 @@ def handle_command(text: str, memory: MemoryStore) -> Optional[str]:
             lines.append(f"- {k}: {v}")
         return "\n".join(lines)
 
-    # Set Verbosity
     if t.lower().startswith("set verbosity:"):
         level = t.split(":", 1)[1].strip().lower()
         if level not in ("full", "normal", "final"):
             return "Invalid verbosity. Use: Set Verbosity: full | normal | final"
-
         memory.set_verbosity(level)
         return f"Verbosity set to: {level}"
-
 
     return None
 
 
 def print_run_summary(run: dict, verbosity: str) -> None:
-    """
-    Print output based on verbosity.
-
-    verbosity modes:
-    - "final": print ONLY the final answer (best for normal use)
-    - "normal": print route + judge + final answer (minimal insight)
-    - "full": print everything (debug mode)
-    """
-
-    # Safety: if verbosity is unknown, treat it as "normal"
+    """Print output based on verbosity."""
     if verbosity not in ("final", "normal", "full"):
         verbosity = "normal"
 
-    # 1) FINAL ONLY
     if verbosity == "final":
         final = run.get("final_answer")
         if final:
             print(final)
         else:
-            # If it's a local_only run, final_answer may be None, so show local output.
             local = run.get("execution", {}).get("local", [])
             if local:
                 print(local)
@@ -180,7 +166,6 @@ def print_run_summary(run: dict, verbosity: str) -> None:
         print()
         return
 
-    # 2) NORMAL (route + judge + final)
     route = run.get("route", {})
     print("\n=== ROUTE ===")
     print(f"Strategy: {route.get('strategy')}")
@@ -193,7 +178,6 @@ def print_run_summary(run: dict, verbosity: str) -> None:
         print(f"Judge provider: {judge.get('judge_provider')}")
         print(f"Judge mode: {judge.get('judge_mode')}")
         print(f"Judge intent: {judge.get('judge_intent')}")
-        # Only print score table in FULL mode, because it's noisy
         if verbosity == "full" and judge.get("judge_mode") == "auto":
             print(f"Score table: {judge.get('judge_score_table')}")
 
@@ -202,7 +186,6 @@ def print_run_summary(run: dict, verbosity: str) -> None:
         print("\n=== FINAL ANSWER ===")
         print(final)
 
-    # If this was local_only, show local output in normal mode too
     local = run.get("execution", {}).get("local", [])
     if local:
         print("\n=== LOCAL OUTPUT ===")
@@ -213,17 +196,13 @@ def print_run_summary(run: dict, verbosity: str) -> None:
             else:
                 print(f"- {item.get('tool')} FAILED: {item.get('error')}")
 
-    # 3) FULL (also show plan + worker outputs + evaluation details)
     if verbosity == "full":
         plan = run.get("plan", {})
         steps = plan.get("steps", [])
-        prompts = plan.get("prompts", {})
-
         print("\n=== PLAN ===")
         for i, step in enumerate(steps, start=1):
             print(f"{i}. {step}")
 
-        # Worker outputs can be long, but in FULL mode we show them
         llm = run.get("execution", {}).get("llm", [])
         if llm:
             print("\n=== WORKER OUTPUTS ===")
@@ -243,32 +222,27 @@ def print_run_summary(run: dict, verbosity: str) -> None:
     print()
 
 
-
 if __name__ == "__main__":
     load_dotenv()
 
     capabilities = load_capabilities()
     memory = MemoryStore(state_path="memory/state.local.json", seed_path="memory/state.json")
     agent = Agent(capabilities=capabilities, memory=memory)
-    # Holds a dev report that has been proposed but not yet confirmed/applied.
+
     pending_dev_report = None
 
-
     print("AI-Orchestrator v0.2 (with Judge)")
-    print("Commands: Show Judge | Set Judge: openai | Set Judge Mode: auto/fixed")
-    print("Type a task and press Enter. Empty input quits.\n")
+    print("Type 'help' for commands. Empty input quits.\n")
     print("DEBUG providers:", list(agent.provider_map.keys()))
 
     while True:
         try:
             text = input("> ").strip()
         except EOFError:
-            # Happens if the run console doesn't provide stdin (or closes it)
             print("\nNo interactive input available (EOF). Check PyCharm run config: enable 'Emulate terminal'.")
             break
 
         if not text:
-            # If we're waiting for a yes/no on a dev patch, don't exit on empty input.
             if pending_dev_report is not None:
                 print("Please answer: yes or no")
                 continue
@@ -292,14 +266,12 @@ if __name__ == "__main__":
                     print(f"Validation OK: {pending_dev_report['apply']['validation_ok']}")
                     print(f"Validation output:\n{pending_dev_report['apply']['validation_output']}")
 
-                # Store dev run in memory
                 memory.add_run({
                     "timestamp": __import__("time").strftime("%Y-%m-%d %H:%M:%S"),
                     "task": f"DEV: {pending_dev_report.get('request', '')}",
                     "dev_report": pending_dev_report
                 })
 
-                # Clear pending state after handling
                 pending_dev_report = None
                 continue
 
@@ -308,7 +280,6 @@ if __name__ == "__main__":
                 pending_dev_report = None
                 continue
 
-            # If they typed something else, keep waiting for a valid yes/no
             print("Please answer: yes or no")
             continue
 
@@ -341,16 +312,14 @@ if __name__ == "__main__":
             print(f"Mode: {report['policy']['mode']}")
             print(f"Authors: {report['policy'].get('author_providers', [])}")
             print(f"Judge: {report['policy'].get('judge_provider')}")
-            print(f"Reason: {report['policy']['reason']}")
+            print(f"Reason: {report['policy'].get('reason', '')}")
 
             print("\n=== DEV JUDGE RATIONALE ===")
-            print(report["judge"]["rationale"] or "(no rationale)")
+            print(report["judge"].get("rationale") or "(no rationale)")
 
             print("\n=== PROPOSED PATCH ===")
-            print(report["chosen_patch"] or "(no patch produced)")
+            print(report.get("chosen_patch") or "(no patch produced)")
 
-            # IMPORTANT: we DO NOT call input("Apply patch?") here anymore.
-            # Instead, we set pending state and let the next user input be the answer.
             pending_dev_report = report
             print("\nApply patch? (yes/no):")
             continue
@@ -361,5 +330,3 @@ if __name__ == "__main__":
         run = agent.run(text)
         verbosity = memory.get_verbosity()
         print_run_summary(run, verbosity)
-
-
