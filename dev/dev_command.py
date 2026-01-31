@@ -11,13 +11,13 @@ Flow:
 5) Show patch + rationale
 6) Ask user to apply (yes/no)
 7) Apply patch
-8) Validate
-9) Return a structured report to be stored in memory
+8) Validate (compile; tests if available)
 
 IMPORTANT:
-- This module must NEVER treat plain text as a patch.
+- Proposal must be side-effect free (no memory writes / no stats updates).
 - Only unified diffs are allowed to be applied.
-- Judge should select among already-generated candidate patches using patch_index.
+- Judge must output STRICT JSON:
+    {"patch_index": <int>, "rationale": "<short text>"}
 """
 
 from __future__ import annotations
@@ -34,123 +34,51 @@ from dev.validate import py_compile_files, run_tests_if_available
 
 
 def _safe_json_load(s: str) -> Optional[dict]:
-    """
-    Attempt to parse JSON from a model output.
-    Returns dict if successful; otherwise None.
-    """
     try:
         return json.loads(s)
     except Exception:
         return None
 
+
 def _strip_markdown_fences(text: str) -> str:
-    """
-    Some models wrap diffs in ```diff ... ``` fences.
-    This removes the fences so apply_patches receives a raw unified diff.
-    """
     t = (text or "").strip()
+    if not t.startswith("```"):
+        return t
 
-    if t.startswith("```"):
-        lines = t.splitlines()
+    lines = t.splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
 
-        # Remove first fence line (``` or ```diff)
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-
-        # Remove last fence line if present
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-
-        return "\n".join(lines).strip()
-
-    return t
 
 def _looks_like_unified_diff(text: str) -> bool:
-    """
-    Small heuristic to detect a unified diff.
-    This prevents accidental "plain text" from being treated as a patch.
-
-    Accepts common diff formats:
-    - "diff --git ..." (git diff format)
-    - "--- a/file" + "+++ b/file" (unified diff format)
-    """
     t = (text or "").strip()
     if not t:
         return False
-
     if "diff --git" in t:
         return True
-
-    # Classic unified diff header
     if t.startswith("--- ") and "\n+++ " in t:
         return True
-
     return False
 
 
 def _extract_patch_text(patch_item: Any) -> str:
-    """
-    Given a candidate patch item, return the patch text.
-
-    Our author_outputs store patches as dicts:
-      {"provider": "...", "success": True, "patch": "<diff text>"}
-
-    But we also accept raw strings defensively.
-    """
     if isinstance(patch_item, dict):
         return str(patch_item.get("patch", "")).strip()
     return str(patch_item).strip()
 
 
 def _choose_first_valid_patch(successful_patches: List[Any]) -> Tuple[str, str]:
-    """
-    Choose the first candidate patch that looks like a unified diff.
-
-    Returns:
-        (patch_text, rationale)
-    """
     for item in successful_patches:
         patch_text = _strip_markdown_fences(_extract_patch_text(item))
         if _looks_like_unified_diff(patch_text):
             return patch_text, "Fallback: selected first candidate patch that looks like a unified diff."
-
-    # No candidate looked valid
     return "", "Fallback: no candidate patch looked like a unified diff; no patch selected."
 
 
-def run_dev_request(
-    repo_root: str,
-    request: str,
-    capabilities: dict,
-    memory: Any,
-    provider_map: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Execute a dev request and return a report dict.
-
-    memory: your MemoryStore object (used for settings/stats/logging)
-    provider_map: {"openai": OpenAIClient(), "claude": ClaudeClient(), ...}
-                 each must provide .generate(prompt) -> str
-    """
-    # Build context for dev models
-    context = build_context_bundle(repo_root=repo_root, request=request)
-
-    # Decide policy (authors + judge) locally
-    policy = DevPolicy(capabilities)
-    provider_stats = memory.get_provider_stats()
-
-    # Dev settings are stored in memory settings
-    dev_settings = {
-        "dev_mode": memory.get_setting("dev_mode", "auto"),
-        "dev_authors": memory.get_setting("dev_authors", None),
-        "dev_judge_provider": memory.get_setting("dev_judge_provider", None),
-        "dev_min_authors": memory.get_setting("dev_min_authors", None),
-        "dev_max_authors": memory.get_setting("dev_max_authors", None),
-        "dev_exploration_rate": memory.get_setting("dev_exploration_rate", None),
-    }
-
-    # Determinism key: must be derived only from repo state + user request.
-    head = "nogit"
+def _git_head(repo_root: str) -> str:
     try:
         completed = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -160,10 +88,88 @@ def run_dev_request(
             check=False,
         )
         if completed.returncode == 0:
-            head = (completed.stdout or "").strip() or "nogit"
+            return (completed.stdout or "").strip() or "nogit"
     except Exception:
-        head = "nogit"
+        pass
+    return "nogit"
 
+
+def _rewrite_to_dev_providers(selected: List[str], provider_map: Dict[str, Any]) -> List[str]:
+    """
+    If runtime has *_dev providers, rewrite base provider names to *_dev equivalents.
+    This avoids "Authors: []" when capabilities lists openai/claude but runtime only
+    exposes openai_dev/claude_dev.
+    """
+    runtime = set(provider_map.keys())
+    has_any_dev = any(k.endswith("_dev") for k in runtime)
+    if not has_any_dev:
+        # No special rewriting needed; just filter to runtime-available.
+        return [p for p in selected if p in runtime]
+
+    rewritten: List[str] = []
+    for p in selected:
+        if p in runtime:
+            rewritten.append(p)
+            continue
+
+        dev_name = f"{p}_dev"
+        if dev_name in runtime:
+            rewritten.append(dev_name)
+            continue
+
+        # Some repos might name dev variants differently; last resort: skip.
+    # Deduplicate while preserving order
+    seen = set()
+    out: List[str] = []
+    for p in rewritten:
+        if p not in seen:
+            out.append(p)
+            seen.add(p)
+    return out
+
+
+def _best_available_judge(preferred: str, provider_map: Dict[str, Any]) -> str:
+    runtime = sorted(provider_map.keys())
+    if not runtime:
+        return ""
+
+    # Prefer rewriting to *_dev if present
+    has_any_dev = any(k.endswith("_dev") for k in runtime)
+    if has_any_dev:
+        if preferred in provider_map:
+            return preferred
+        if f"{preferred}_dev" in provider_map:
+            return f"{preferred}_dev"
+        # Prefer openai_dev if it exists
+        if "openai_dev" in provider_map:
+            return "openai_dev"
+
+    # Otherwise use preferred if exists, else first
+    return preferred if preferred in provider_map else runtime[0]
+
+
+def run_dev_request(
+    repo_root: str,
+    request: str,
+    capabilities: dict,
+    memory: Any,
+    provider_map: Dict[str, Any],
+) -> Dict[str, Any]:
+    context = build_context_bundle(repo_root=repo_root, request=request)
+
+    policy = DevPolicy(capabilities)
+    provider_stats = memory.get_provider_stats()
+
+    dev_settings = {
+        "dev_mode": memory.get_setting("dev_mode", "auto"),
+        "dev_authors": memory.get_setting("dev_authors", None),
+        "dev_judge_provider": memory.get_setting("dev_judge_provider", None),
+        "dev_min_authors": memory.get_setting("dev_min_authors", None),
+        "dev_max_authors": memory.get_setting("dev_max_authors", None),
+        "dev_exploration_rate": memory.get_setting("dev_exploration_rate", None),
+    }
+
+    head = _git_head(repo_root)
     determinism_key = f"{head}\n{request.strip()}"
 
     decision = policy.decide(
@@ -172,15 +178,17 @@ def run_dev_request(
         determinism_key=determinism_key,
     )
 
-    # Filter decision to providers that are actually available at runtime.
-    # Prefer *_dev providers for the self-patching loop when present.
-    runtime_available = sorted(provider_map.keys())
-    dev_available = [p for p in runtime_available if p.endswith("_dev")]
-    available_providers = set(dev_available or runtime_available)
-    decision.author_providers = [p for p in decision.author_providers if p in available_providers]
-    if decision.judge_provider not in available_providers:
-        # Keep deterministic fallback if the default judge isn't available.
-        decision.judge_provider = next(iter(sorted(available_providers)), "")
+    # Rewrite author providers to *_dev equivalents when applicable
+    decision.author_providers = _rewrite_to_dev_providers(decision.author_providers, provider_map)
+
+    # Ensure we have at least one author; if policy picked none, fall back to any dev providers.
+    if not decision.author_providers:
+        runtime = sorted(provider_map.keys())
+        devs = [p for p in runtime if p.endswith("_dev")]
+        decision.author_providers = devs[:2] if devs else runtime[:2]
+
+    # Choose judge deterministically among available runtime providers
+    decision.judge_provider = _best_available_judge(decision.judge_provider, provider_map)
 
     # ----------------------------
     # 1) Generate candidate patches
@@ -202,7 +210,6 @@ def run_dev_request(
 
         try:
             patch_text = client.generate(author_prompt)
-            # Remove ```diff fences early so everything downstream is clean.
             patch_text = _strip_markdown_fences(patch_text)
             author_outputs.append({"provider": provider_name, "success": True, "patch": patch_text})
         except Exception as e:
@@ -219,21 +226,19 @@ def run_dev_request(
     judge_raw_output = ""
 
     judge_client = provider_map.get(decision.judge_provider)
-
     candidate_patch_texts = [_extract_patch_text(p) for p in successful_patches]
 
     judge_prompt = build_judge_prompt(
         request=request,
         context=context,
-        patches=candidate_patch_texts,  # list[str], not list[dict]
+        patches=candidate_patch_texts,
     )
 
     if not judge_client or not successful_patches:
         chosen_patch, judge_rationale = _choose_first_valid_patch(successful_patches)
         if not judge_client:
             judge_rationale = (
-                f"Judge unavailable: '{decision.judge_provider}' not in provider_map. "
-                f"{judge_rationale}"
+                f"Judge unavailable: '{decision.judge_provider}' not in provider_map. {judge_rationale}"
             )
         else:
             judge_rationale = f"No successful patches to judge. {judge_rationale}"
@@ -242,7 +247,6 @@ def run_dev_request(
         try:
             judge_output = judge_client.generate(judge_prompt)
             judge_raw_output = judge_output
-
             judge_json = _safe_json_load(judge_output)
 
             if judge_json and "patch_index" in judge_json:
@@ -250,31 +254,24 @@ def run_dev_request(
                 judge_rationale = str(judge_json.get("rationale", "")).strip()
 
                 if isinstance(idx, int) and 0 <= idx < len(candidate_patch_texts):
-                    candidate = candidate_patch_texts[idx].strip()
-                    candidate = _strip_markdown_fences(candidate)
-
+                    candidate = _strip_markdown_fences(candidate_patch_texts[idx].strip())
                     if _looks_like_unified_diff(candidate):
                         chosen_patch = candidate
                         judge_ok = True
                     else:
                         chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
                         judge_rationale = (
-                            f"Judge selected patch_index={idx}, but selected patch did not look like a unified diff. "
+                            f"Judge selected patch_index={idx}, but it didn't look like a unified diff. "
                             f"{fallback_reason}"
                         )
                 else:
                     chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
-                    judge_rationale = (
-                        f"Judge returned invalid patch_index={idx}. {fallback_reason}"
-                    )
-
+                    judge_rationale = f"Judge returned invalid patch_index={idx}. {fallback_reason}"
             else:
                 chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
                 judge_rationale = (
-                    "Judge did not return valid JSON with patch_index; ignored raw judge output. "
-                    f"{fallback_reason}\n"
-                    "Raw judge output was:\n"
-                    f"{judge_output.strip()}"
+                    "Judge did not return strict JSON with patch_index; ignored raw judge output. "
+                    f"{fallback_reason}\nRaw judge output:\n{judge_output.strip()}"
                 )
 
         except Exception as e:
@@ -304,6 +301,9 @@ def run_dev_request(
             "changed_files": [],
             "validation_ok": False,
             "validation_output": "",
+            "tests_ran": False,
+            "tests_ok": True,
+            "tests_output": "",
             "error": "",
         },
     }
@@ -312,24 +312,22 @@ def run_dev_request(
 
 
 def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Apply the chosen patch in report to filesystem and validate.
-
-    This is separated so main.py can ask user "yes/no" before calling apply.
-    """
     patch = (report.get("chosen_patch") or "").strip()
     patch = _strip_markdown_fences(patch)
 
     report.setdefault("apply", {})
-    report["apply"].setdefault("attempted", False)
-    report["apply"].setdefault("applied", False)
-    report["apply"].setdefault("changed_files", [])
-    report["apply"].setdefault("validation_ok", False)
-    report["apply"].setdefault("validation_output", "")
-    report["apply"].setdefault("tests_ran", False)
-    report["apply"].setdefault("tests_ok", True)
-    report["apply"].setdefault("tests_output", "")
-    report["apply"].setdefault("error", "")
+    for k, v in {
+        "attempted": False,
+        "applied": False,
+        "changed_files": [],
+        "validation_ok": False,
+        "validation_output": "",
+        "tests_ran": False,
+        "tests_ok": True,
+        "tests_output": "",
+        "error": "",
+    }.items():
+        report["apply"].setdefault(k, v)
 
     if not patch:
         report["apply"]["attempted"] = True
