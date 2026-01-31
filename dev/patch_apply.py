@@ -1,25 +1,31 @@
 """
 dev/patch_apply.py
 ------------------
-Applies unified diff patches to the local filesystem with safety checks.
+Applies unified diff patches to the local filesystem.
 
-This is intentionally conservative:
-- If parsing fails, we refuse to apply.
-- If a hunk doesn't match the current file, we refuse to apply.
-- We create backups in memory (returned to caller) so you can rollback later.
+v1 improvement:
+- Try `git apply` FIRST (more robust; supports fuzzy matching).
+- If git apply fails (or git not available), fall back to our strict applier.
 
-Supported:
-- Update existing text files
-- Create new files (diff where original is /dev/null)
-- Standard unified diff format with --- / +++ and @@ hunks
+Why this matters:
+LLM-generated patches often have slightly different context / line numbers.
+Your strict applier will refuse those patches (by design).
+`git apply` is the correct tool for patch application and will handle drift.
 
-Note: This is a "good enough v0" applier for typical LLM diffs.
-For complex patches, you can later switch to a robust patch library.
+Safety:
+- We still refuse to write outside repo_root.
+- We still refuse non-unified-diff input (handled earlier in dev_command.py).
+- We optionally snapshot target files (best-effort backups) before applying.
+
+Returned backups:
+- Dict[path -> old_content] for the files the diff touches (best-effort).
+  If a file did not exist before, backup is "".
 """
 
 from __future__ import annotations
 
 import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -35,6 +41,7 @@ class FilePatch:
 
 
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
 
 def parse_unified_diff(diff_text: str) -> List[FilePatch]:
     """
@@ -54,13 +61,15 @@ def parse_unified_diff(diff_text: str) -> List[FilePatch]:
     def flush_current():
         nonlocal current_old, current_new, current_path, hunks, is_new_file
         if current_path and (hunks or is_new_file):
-            patches.append(FilePatch(
-                path=current_path,
-                old_path=current_old,
-                new_path=current_new,
-                hunks=hunks,
-                is_new_file=is_new_file
-            ))
+            patches.append(
+                FilePatch(
+                    path=current_path,
+                    old_path=current_old,
+                    new_path=current_new,
+                    hunks=hunks,
+                    is_new_file=is_new_file,
+                )
+            )
         current_old = None
         current_new = None
         current_path = None
@@ -79,29 +88,30 @@ def parse_unified_diff(diff_text: str) -> List[FilePatch]:
         if line.startswith("--- "):
             flush_current()
             current_old = line[4:].strip()
-            # detect new file
+
+            # Detect new file
             if current_old == "/dev/null":
                 is_new_file = True
+
             i += 1
             if i >= len(lines) or not lines[i].startswith("+++ "):
                 raise ValueError("Invalid diff: expected '+++' after '---'")
+
             current_new = lines[i][4:].strip()
 
-            # Determine the target path:
-            # Common formats:
-            # --- a/path
-            # +++ b/path
-            # or --- path
-            # We'll prefer new path if present.
+            # Determine the target path (prefer new path)
             candidate = current_new
+
             # Strip a/ or b/ prefixes if present
             if candidate.startswith("b/"):
                 candidate = candidate[2:]
             if candidate.startswith("a/"):
                 candidate = candidate[2:]
+
             if candidate == "/dev/null":
-                # If deleting a file, not supported in v0
-                raise ValueError("File deletion patches not supported in v0.")
+                # File deletion not supported in this project v0/v1
+                raise ValueError("File deletion patches not supported.")
+
             current_path = candidate
             i += 1
             continue
@@ -115,7 +125,6 @@ def parse_unified_diff(diff_text: str) -> List[FilePatch]:
             new_len = int(m.group(4) or "1")
             i += 1
             hunk_lines: List[str] = []
-            # Hunk body lines start with ' ', '+', '-'
             while i < len(lines) and not lines[i].startswith(("@@ ", "--- ", "diff --git")):
                 hunk_lines.append(lines[i])
                 i += 1
@@ -132,31 +141,110 @@ def parse_unified_diff(diff_text: str) -> List[FilePatch]:
     return patches
 
 
+def _safe_target_path(repo_root: Path, rel_path: str) -> Path:
+    """
+    Build an absolute path and ensure it stays inside repo_root.
+    """
+    target = (repo_root / rel_path).resolve()
+    if not str(target).startswith(str(repo_root)):
+        raise ValueError(f"Refusing to write outside repo root: {rel_path}")
+    return target
+
+
+def _snapshot_backups(repo_root: str, diff_text: str) -> Dict[str, str]:
+    """
+    Best-effort backups: read the current content of every file touched by the diff.
+
+    This gives you rollback ability even when we apply via `git apply`.
+    """
+    root = Path(repo_root).resolve()
+    file_patches = parse_unified_diff(diff_text)
+    backups: Dict[str, str] = {}
+
+    for fp in file_patches:
+        target = _safe_target_path(root, fp.path)
+
+        if fp.is_new_file:
+            backups[fp.path] = ""  # new file didn't exist
+        else:
+            if target.exists():
+                backups[fp.path] = target.read_text(encoding="utf-8")
+            else:
+                # If the patch targets a missing file, record empty; strict fallback will raise.
+                backups[fp.path] = ""
+
+    return backups
+
+
+def _try_git_apply(repo_root: str, diff_text: str) -> Tuple[bool, str]:
+    """
+    Try applying a patch using git (more robust than our strict applier).
+    Returns (ok, message).
+
+    Notes:
+    - Requires repo_root to be inside a git repository (git init).
+    - Uses --whitespace=nowarn to avoid failures on whitespace differences.
+    """
+    try:
+        # `git apply` can take patch data via stdin with "-".
+        result = subprocess.run(
+            ["git", "apply", "--whitespace=nowarn", "-"],
+            cwd=repo_root,
+            input=diff_text,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            return True, "git apply succeeded"
+        return False, (result.stderr or result.stdout or "git apply failed")
+    except FileNotFoundError:
+        return False, "git not found on PATH"
+    except Exception as e:
+        return False, f"git apply exception: {e}"
+
+
 def apply_patches(repo_root: str, diff_text: str) -> Dict[str, str]:
     """
     Apply the diff to files under repo_root.
 
-    Returns a dict of {path: old_content} for rollback.
+    Returns:
+        backups: dict of {path: old_content} for rollback.
 
-    Raises ValueError on mismatch or parse errors.
+    Behavior:
+    1) Snapshot backups (best-effort)
+    2) Try `git apply` (robust/fuzzy)
+    3) If git apply fails, fall back to strict applier
+
+    Raises:
+        ValueError on mismatch or parse errors (strict fallback path).
     """
+    # 1) Snapshot backups so caller can rollback later if needed.
+    backups = _snapshot_backups(repo_root, diff_text)
+
+    # 2) Try git apply first (best user experience)
+    ok, msg = _try_git_apply(repo_root, diff_text)
+    if ok:
+        return backups  # applied successfully via git
+
+    # If git apply failed, fall back to strict applier.
+    # This keeps your original conservative behavior as a safety net.
+    # The strict applier will raise ValueError if hunks mismatch.
+    # You can comment out fallback if you prefer "git only".
+    # print(f"DEBUG: git apply failed, falling back to strict applier. Reason: {msg}")
+
+    # --- STRICT FALLBACK (your original implementation) ---
     root = Path(repo_root).resolve()
     file_patches = parse_unified_diff(diff_text)
 
-    backups: Dict[str, str] = {}
-
     for fp in file_patches:
-        target = (root / fp.path).resolve()
-        if not str(target).startswith(str(root)):
-            raise ValueError(f"Refusing to write outside repo root: {fp.path}")
+        target = _safe_target_path(root, fp.path)
 
         if fp.is_new_file:
             if target.exists():
                 raise ValueError(f"Patch wants to create new file but it already exists: {fp.path}")
             new_content = _apply_to_lines([], fp.hunks)
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text("\n".join(new_content) + ("\n" if new_content and not new_content[-1].endswith("\n") else ""), encoding="utf-8")
-            backups[fp.path] = ""  # new file backup is empty
+            target.write_text("\n".join(new_content) + ("\n" if new_content else ""), encoding="utf-8")
             continue
 
         # Existing file update
@@ -164,8 +252,6 @@ def apply_patches(repo_root: str, diff_text: str) -> Dict[str, str]:
             raise ValueError(f"Patch targets missing file: {fp.path}")
 
         old_text = target.read_text(encoding="utf-8")
-        backups[fp.path] = old_text
-
         old_lines = old_text.splitlines()
         new_lines = _apply_to_lines(old_lines, fp.hunks)
         target.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
@@ -190,48 +276,44 @@ def _apply_to_lines(old_lines: List[str], hunks: List[Tuple[int, int, int, int, 
         # Convert to 0-based index, applying current offset
         idx = (old_start - 1) + offset
 
-        # We'll walk through hunk lines and build the replacement chunk
-        # while verifying context.
         new_chunk: List[str] = []
         consume_idx = idx
 
         for hl in hunk_lines:
-            if not hl:
-                # empty line can be context; unified diff represents it as " " + ""
-                # but some generators might produce empty strings; treat as context mismatch
+            if hl == "":
+                # Some generators may produce empty strings (malformed).
                 raise ValueError("Malformed hunk line (empty).")
 
             tag = hl[0]
             text = hl[1:]  # rest of the line without prefix
 
             if tag == " ":
-                # context: must match existing line
                 if consume_idx >= len(lines) or lines[consume_idx] != text:
-                    raise ValueError(f"Hunk context mismatch at line {consume_idx + 1}. Expected '{text}', found '{lines[consume_idx] if consume_idx < len(lines) else 'EOF'}'")
+                    raise ValueError(
+                        f"Hunk context mismatch at line {consume_idx + 1}. "
+                        f"Expected '{text}', found '{lines[consume_idx] if consume_idx < len(lines) else 'EOF'}'"
+                    )
                 new_chunk.append(text)
                 consume_idx += 1
 
             elif tag == "-":
-                # removal: must match existing line
                 if consume_idx >= len(lines) or lines[consume_idx] != text:
-                    raise ValueError(f"Hunk removal mismatch at line {consume_idx + 1}. Expected '{text}', found '{lines[consume_idx] if consume_idx < len(lines) else 'EOF'}'")
-                # removed line is NOT added to new_chunk
+                    raise ValueError(
+                        f"Hunk removal mismatch at line {consume_idx + 1}. "
+                        f"Expected '{text}', found '{lines[consume_idx] if consume_idx < len(lines) else 'EOF'}'"
+                    )
                 consume_idx += 1
 
             elif tag == "+":
-                # addition: add new line
                 new_chunk.append(text)
 
             else:
                 raise ValueError(f"Unknown hunk tag '{tag}' in line: {hl}")
 
-        # Replace the consumed range with new_chunk
         before = lines[:idx]
         after = lines[consume_idx:]
         lines = before + new_chunk + after
 
-        # Update offset: new length - old length (approx)
-        # consume_idx - idx is old consumed size
         consumed_old = consume_idx - idx
         offset += (len(new_chunk) - consumed_old)
 
