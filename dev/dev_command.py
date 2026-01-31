@@ -3,8 +3,9 @@ dev/dev_command.py
 ------------------
 Developer loop for self-patching the repo.
 
-Correctness-first invariant:
+Correctness-first invariants:
 - Self-patching must be reproducible from repo state.
+- Candidate patches must pass `git apply --check` before they are eligible.
 
 Two-step flow (matches main.py):
 1) run_dev_request(...) proposes a patch (does NOT apply).
@@ -22,7 +23,7 @@ import json
 import re
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 from dev.context import build_context_bundle
 from dev.patch_apply import apply_patches
@@ -104,23 +105,62 @@ def _looks_like_unified_diff(text: str) -> bool:
     return bool(text) and isinstance(text, str) and bool(_DIFF_START_RE.search(text))
 
 
-def _first_valid_patch_from_authors(author_outputs: List[Dict[str, Any]]) -> Tuple[str, str]:
-    """Fallback: choose first author patch that looks like a unified diff."""
+def _git_apply_check_patch(repo_root: str, patch_text: str) -> Tuple[bool, str]:
+    """
+    Ground-truth validation:
+    A patch is only considered valid if `git apply --check` accepts it.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "apply", "--check", "--3way", "--whitespace=nowarn", "-"],
+            cwd=repo_root,
+            input=patch_text,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            return True, "git apply --check ok"
+        return False, (result.stderr or result.stdout or "git apply --check failed")
+    except FileNotFoundError:
+        # If git is unavailable, we cannot enforce this invariant here.
+        # In that case, we allow "looks like unified diff" and rely on strict fallback in patch_apply.py.
+        return True, "git not found; skipping git apply --check gating"
+    except Exception as e:
+        return False, f"git apply --check exception: {e}"
+
+
+def _first_valid_patch_from_authors(repo_root: str, author_outputs: List[Dict[str, Any]]) -> Tuple[str, str]:
+    """
+    Fallback: choose first author patch that:
+    1) looks like unified diff, AND
+    2) passes git apply --check (when git exists).
+    """
     for item in author_outputs:
         if not item.get("success"):
             continue
         patch = _strip_markdown_fences(item.get("patch", "") or "")
-        if _looks_like_unified_diff(patch):
-            return patch, "Fallback: selected first candidate patch that looks like a unified diff."
-    return "", "Fallback: no candidate patch looked like a unified diff; no patch selected."
+        if not _looks_like_unified_diff(patch):
+            continue
+        ok, msg = _git_apply_check_patch(repo_root, patch)
+        if ok:
+            return patch, "Fallback: selected first candidate patch that passed git apply --check."
+    return "", "Fallback: no candidate patch passed git apply --check; no patch selected."
 
 
-def _extract_author_patches(author_outputs: List[Dict[str, Any]]) -> List[str]:
-    """Return list of patch texts (same ordering as author_outputs, but only successful ones)."""
+def _extract_author_patches(repo_root: str, author_outputs: List[Dict[str, Any]]) -> List[str]:
+    """
+    Return list of patch texts (in author order), but ONLY those that pass git apply --check (when available).
+    """
     patches: List[str] = []
     for item in author_outputs:
-        if item.get("success") and isinstance(item.get("patch"), str):
-            patches.append(_strip_markdown_fences(item["patch"]))
+        if not item.get("success") or not isinstance(item.get("patch"), str):
+            continue
+        patch = _strip_markdown_fences(item["patch"])
+        if not _looks_like_unified_diff(patch):
+            continue
+        ok, _ = _git_apply_check_patch(repo_root, patch)
+        if ok:
+            patches.append(patch)
     return patches
 
 
@@ -134,7 +174,6 @@ def _parse_judge_json(text: str) -> Tuple[int, str]:
 
     if not isinstance(data, dict):
         raise ValueError("Judge output JSON was not an object.")
-
     if "patch_index" not in data:
         raise ValueError("Judge JSON missing 'patch_index'.")
     if "rationale" not in data:
@@ -242,24 +281,43 @@ def run_dev_request(
             continue
 
         try:
-            patch_text = _strip_markdown_fences(client.generate(author_prompt))
+            raw = client.generate(author_prompt)
+            patch_text = _strip_markdown_fences(raw)
+
+            # Gate: must look like diff AND pass git apply --check (when git exists)
+            if not _looks_like_unified_diff(patch_text):
+                author_outputs.append(
+                    {"provider": provider_name, "success": False, "error": "Output did not look like a unified diff."}
+                )
+                memory.update_provider_stats(provider_name, success=False)
+                continue
+
+            ok, msg = _git_apply_check_patch(repo_root, patch_text)
+            if not ok:
+                author_outputs.append(
+                    {"provider": provider_name, "success": False, "error": f"Rejected by git apply --check: {msg}"}
+                )
+                memory.update_provider_stats(provider_name, success=False)
+                continue
+
             author_outputs.append({"provider": provider_name, "success": True, "patch": patch_text})
             memory.update_provider_stats(provider_name, success=True)
+
         except Exception as e:
             author_outputs.append({"provider": provider_name, "success": False, "error": str(e)})
             memory.update_provider_stats(provider_name, success=False)
 
     report["authors"] = author_outputs
 
-    # Prepare patch list for judge (successful patches only, in order)
-    patches = _extract_author_patches(author_outputs)
+    # Only check-passing patches get judged
+    patches = _extract_author_patches(repo_root, author_outputs)
 
-    # If we have no usable patches, stop early with empty chosen_patch
     if not patches:
+        # Make it explicit WHY no patch is available (the per-provider errors are in report["authors"])
         report["judge"] = {
             "provider": judge_provider,
             "success": False,
-            "rationale": "No valid author patches available to judge.",
+            "rationale": "No candidate patches passed git apply --check; refusing to choose a patch.",
         }
         report["chosen_patch"] = ""
         return report
@@ -279,7 +337,6 @@ def run_dev_request(
                 raise ValueError(f"Judge patch_index out of range: {idx} (0..{len(patches)-1})")
 
             chosen_patch = patches[idx]
-
             report["judge"] = {
                 "provider": judge_provider,
                 "success": True,
@@ -288,7 +345,7 @@ def run_dev_request(
             memory.update_provider_stats(judge_provider, success=True)
 
         except Exception as e:
-            chosen_patch, fallback_reason = _first_valid_patch_from_authors(author_outputs)
+            chosen_patch, fallback_reason = _first_valid_patch_from_authors(repo_root, author_outputs)
             report["judge"] = {
                 "provider": judge_provider,
                 "success": False,
@@ -297,7 +354,7 @@ def run_dev_request(
             if judge_provider:
                 memory.update_provider_stats(judge_provider, success=False)
     else:
-        chosen_patch, rationale = _first_valid_patch_from_authors(author_outputs)
+        chosen_patch, rationale = _first_valid_patch_from_authors(repo_root, author_outputs)
         report["judge"] = {
             "provider": judge_provider,
             "success": False,
@@ -347,6 +404,13 @@ def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
         report["apply"]["error"] = "Chosen patch did not look like a unified diff. Refusing to apply."
         return report
 
+    # Extra safety: re-check the chosen patch before applying
+    ok, msg = _git_apply_check_patch(repo_root, patch)
+    if not ok:
+        report["apply"]["applied"] = False
+        report["apply"]["error"] = f"Chosen patch rejected by git apply --check. Refusing to apply:\n{msg}"
+        return report
+
     if not base_commit:
         report["apply"]["applied"] = False
         report["apply"]["error"] = "Missing base_commit in report; cannot enforce reproducibility."
@@ -362,8 +426,8 @@ def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
         report["apply"]["changed_files"] = changed_files
         report["apply"]["applied"] = True
 
-        ok, out = py_compile_files(repo_root=repo_root, changed_paths=changed_files)
-        report["apply"]["validation_ok"] = ok
+        ok2, out = py_compile_files(repo_root=repo_root, changed_paths=changed_files)
+        report["apply"]["validation_ok"] = ok2
         report["apply"]["validation_output"] = out
 
         return report
