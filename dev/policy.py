@@ -18,6 +18,7 @@ It provides stable structure so you can improve it later without rewriting every
 
 from __future__ import annotations
 
+import hashlib
 import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -47,6 +48,7 @@ class DevPolicy:
         self,
         provider_stats: Dict[str, Any],
         settings: Dict[str, Any],
+        determinism_key: str | None = None,
     ) -> DevPolicyDecision:
         """
         Decide dev authors + judge using:
@@ -85,14 +87,8 @@ class DevPolicy:
         judge = self.default_judge_provider if self.default_judge_provider in enabled else (enabled[0] if enabled else "")
 
         # 2) Choose number of authors:
-        # If we have low data, use more authors.
-        # We'll define "low data" as: total runs across all providers < threshold.
         total_observations = self._total_observations(provider_stats)
 
-        # Simple rule:
-        # - Very low data => use max_authors
-        # - Moderate data => use min_authors+1
-        # - Higher data => use min_authors (plus exploration sometimes)
         if total_observations < 10:
             k = max_authors
             reason_k = f"Low data (total_observations={total_observations}): using max_authors={max_authors}."
@@ -103,17 +99,17 @@ class DevPolicy:
             k = min_authors
             reason_k = f"Enough data (total_observations={total_observations}): using min_authors={min_authors}."
 
-        # Exploration: sometimes add one extra author (if available)
-        if enabled and random.random() < exploration_rate:
-            k = min(len(enabled), k + 1)
-            reason_k += f" Exploration triggered (rate={exploration_rate})."
+        # Exploration: deterministic (repo state + request), not random.
+        if enabled and exploration_rate > 0.0:
+            if determinism_key is None:
+                determinism_key = "dev_policy"
+
+            if self._deterministic_chance(determinism_key) < exploration_rate:
+                k = min(len(enabled), k + 1)
+                reason_k += f" Deterministic exploration triggered (rate={exploration_rate})."
 
         # 3) Choose which authors:
-        # Score providers by their historical "dev usefulness" proxy.
-        # For now, we use success/failure as a crude proxy. Later you'll refine.
         scored = sorted(enabled, key=lambda p: self._score_provider(p, provider_stats), reverse=True)
-
-        # Ensure judge can also be an author if it scores high; that's ok.
         authors = scored[:min(k, len(scored))]
 
         return DevPolicyDecision(
@@ -125,7 +121,13 @@ class DevPolicy:
 
     def _enabled_providers(self) -> List[str]:
         providers = self.capabilities.get("providers", {})
-        return [name for name, cfg in providers.items() if cfg.get("enabled", False)]
+        return sorted([name for name, cfg in providers.items() if cfg.get("enabled", False)])
+
+    def _deterministic_chance(self, key: str) -> float:
+        """Return a deterministic float in [0, 1) derived from a string key."""
+        h = hashlib.sha256(key.encode("utf-8")).digest()
+        n = int.from_bytes(h[:8], byteorder="big", signed=False)
+        return n / float(2**64)
 
     def _filter_available(self, requested: Optional[List[str]], enabled: List[str]) -> List[str]:
         if not requested:
@@ -134,21 +136,12 @@ class DevPolicy:
 
     def _total_observations(self, provider_stats: Dict[str, Any]) -> int:
         total = 0
-        for p, s in provider_stats.items():
+        for _p, s in provider_stats.items():
             total += int(s.get("success", 0))
             total += int(s.get("failure", 0))
         return total
 
     def _score_provider(self, provider: str, provider_stats: Dict[str, Any]) -> int:
-        """
-        Crude scoring:
-        +1 per success, -2 per failure.
-
-        Later you can:
-        - track dev-specific stats separately
-        - track patch acceptance rate
-        - track validation pass rate
-        """
         s = provider_stats.get(provider, {"success": 0, "failure": 0})
         succ = int(s.get("success", 0))
         fail = int(s.get("failure", 0))

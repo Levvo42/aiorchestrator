@@ -95,8 +95,6 @@ class Agent:
         # ----------------------------
         # OpenAI (cheap/default)
         # ----------------------------
-        # OpenAIClient checks OPENAI_API_KEY at call-time; however we still avoid
-        # registering it if the key is missing, so routing/judge doesn't pick it.
         if self._provider_enabled_in_capabilities("openai") and os.getenv("OPENAI_API_KEY"):
             provider_map["openai"] = OpenAIClient(
                 model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
@@ -115,7 +113,6 @@ class Agent:
         # ----------------------------
         # Claude (cheap/default)
         # ----------------------------
-        # ClaudeClient raises in __init__ if key is missing, so we must guard.
         if self._provider_enabled_in_capabilities("claude") and os.getenv("ANTHROPIC_API_KEY"):
             provider_map["claude"] = ClaudeClient(
                 model=os.getenv("ANTHROPIC_MODEL", os.getenv("ANTHROPIC_DEV_MODEL")),
@@ -128,19 +125,12 @@ class Agent:
         if self._provider_enabled_in_capabilities("claude_dev") and os.getenv("ANTHROPIC_API_KEY"):
             provider_map["claude_dev"] = ClaudeClient(
                 model=os.getenv("ANTHROPIC_DEV_MODEL", "claude-sonnet-4-5"),
-                temperature=0.1,
+                temperature=0.0,
             )
 
         # ----------------------------
         # Gemini (optional)
         # ----------------------------
-        # Only enable if:
-        # - You have a Gemini client implemented and imported above
-        # - And you have the relevant environment variable set (example: GOOGLE_API_KEY)
-        #
-        # If your project uses a different env var name (e.g. GEMINI_API_KEY),
-        # update the check accordingly.
-        #
         # if self._provider_enabled_in_capabilities("gemini") and os.getenv("GOOGLE_API_KEY"):
         #     provider_map["gemini"] = GeminiClient(
         #         model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -153,21 +143,12 @@ class Agent:
     # ----------------------------
 
     def run(self, task: str) -> Dict[str, Any]:
-        """
-        Runs the agent end-to-end and returns a structured result.
-        """
         started = time.time()
 
-        # 1) Decide strategy up front (NOT sequential fallback)
         route = self.router.decide(task)
-
-        # 2) Create a plan
         plan = self.planner.make_plan(task, route)
-
-        # 3) Execute plan (local tools and/or LLM calls)
         execution = self._execute(plan, route)
 
-        # 4) Judge step: produce ONE final answer for LLM-based tasks
         final_answer: Optional[str] = None
         judge_info: Optional[Dict[str, Any]] = None
 
@@ -175,7 +156,6 @@ class Agent:
             judge_cfg = self.memory.get_judge_config()
             provider_stats = self.memory.get_provider_stats()
 
-            # Worker outputs are inside execution["llm"]
             decision, final = self.judge.judge(
                 task=task,
                 worker_outputs=execution.get("llm", []),
@@ -193,10 +173,8 @@ class Agent:
             }
             final_answer = final
 
-        # 5) Evaluate (simple v0 evaluation)
         evaluation = self._evaluate(route, execution, final_answer)
 
-        # 6) Store run in memory
         run_record = {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "task": task,
@@ -211,7 +189,6 @@ class Agent:
             "final_answer": final_answer,
             "evaluation": evaluation,
             "elapsed_seconds": round(time.time() - started, 3),
-            # Helpful debug: record which providers were available for this run
             "available_providers": list(self.provider_map.keys()),
         }
         self.memory.add_run(run_record)
@@ -223,12 +200,8 @@ class Agent:
     # ----------------------------
 
     def _execute(self, plan: Plan, route: RouteDecision) -> Dict[str, Any]:
-        """
-        Execute local actions and/or call external providers.
-        """
         result: Dict[str, Any] = {"local": [], "llm": []}
 
-        # Local-only execution
         if route.strategy == "local_only":
             for action in plan.local_actions:
                 tool = action["tool"]
@@ -236,9 +209,6 @@ class Agent:
                 result["local"].append(self._run_local_tool(tool, args))
             return result
 
-        # LLM execution (single or multi)
-        # plan.prompts should already have selected provider names like:
-        # {"openai": "...", "claude_dev": "..."} depending on routing/policy
         for provider_name, prompt in plan.prompts.items():
             client = self.provider_map.get(provider_name)
             if not client:
@@ -277,9 +247,6 @@ class Agent:
         return result
 
     def _run_local_tool(self, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Run one local tool safely and return a structured record.
-        """
         try:
             if tool == "list_dir":
                 path = args.get("path", ".")
@@ -303,11 +270,6 @@ class Agent:
             return {"tool": tool, "args": args, "success": False, "error": str(e)}
 
     def _evaluate(self, route: RouteDecision, execution: Dict[str, Any], final_answer: Any) -> Dict[str, Any]:
-        """
-        v0 evaluation:
-        - local_only: all local tool steps succeeded
-        - llm strategies: final_answer exists (judge produced something)
-        """
         if route.strategy == "local_only":
             ok = all(step.get("success") for step in execution.get("local", []))
             return {"success": ok, "notes": "Local tool execution success check."}
