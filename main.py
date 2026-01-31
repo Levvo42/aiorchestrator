@@ -13,6 +13,7 @@ You can type tasks, or commands like:
 from __future__ import annotations
 from dotenv import load_dotenv
 load_dotenv()
+import subprocess
 import json
 from pathlib import Path
 from typing import Optional
@@ -71,6 +72,37 @@ def handle_command(text: str, memory: MemoryStore) -> Optional[str]:
         memory.set_setting("dev_authors", authors if authors else None)
         return f"Dev authors set to: {authors}"
 
+    if t.lower().startswith("dev: commit with message"):
+        # Extract message after "Dev: Commit with message"
+        parts = text.split("\"")
+        if len(parts) < 2:
+            return "Usage: Dev: Commit with message \"<your commit message>\""
+        
+        commit_msg = parts[1].strip()
+        if not commit_msg:
+            return "Commit message cannot be empty."
+        
+        # Check if there's a pending dev report with successful validation
+        if pending_dev_report is None:
+            return "No dev patch has been applied. Use 'Dev: <request>' first, then apply the patch."
+        
+        if not pending_dev_report.get("apply", {}).get("applied"):
+            return "Last dev patch was not applied successfully."
+        
+        if not pending_dev_report.get("apply", {}).get("validation_ok"):
+            return "Cannot commit: last dev patch did not pass validation."
+        
+        # Check if working tree is clean (only staged changes allowed)
+        try:
+            result = subprocess.run(["git", "diff", "--quiet"], cwd=".", check=False)
+            if result.returncode != 0:
+                return "Cannot commit: working tree has unstaged changes. Stage your changes first with 'git add'."
+            
+            subprocess.run(["git", "commit", "-m", commit_msg], cwd=".", check=True, capture_output=True, text=True)
+            return f"Committed successfully with message: \"{commit_msg}\""
+        except subprocess.CalledProcessError as e:
+            return f"Git commit failed: {e.stderr if e.stderr else str(e)}"
+
     if t.lower() == "help":
         return (
             "Available commands:\n"
@@ -87,6 +119,7 @@ def handle_command(text: str, memory: MemoryStore) -> Optional[str]:
             "  Set Dev Mode: auto | fixed\n"
             "  Set Dev Judge: <provider>\n"
             "  Set Dev Authors: a, b, c\n"
+            "  Dev: Commit with message \"<msg>\"\n"
             "\nExamples:\n"
             "  Set Judge: gemini\n"
             "  Set Verbosity: final\n"
@@ -254,6 +287,7 @@ if __name__ == "__main__":
     agent = Agent(capabilities=capabilities, memory=memory)
     # Holds a dev report that has been proposed but not yet confirmed/applied.
     pending_dev_report = None
+    last_applied_dev_report = None
 
 
     print("AI-Orchestrator v0.2 (with Judge)")
@@ -283,6 +317,9 @@ if __name__ == "__main__":
             answer = text.strip().lower()
 
             if answer in ("y", "yes"):
+                # Store the report before applying so we can reference it for commits
+                last_applied_dev_report = pending_dev_report
+                
                 pending_dev_report = apply_dev_patch(repo_root=".", report=pending_dev_report)
 
                 print("\n=== APPLY RESULT ===")
@@ -319,6 +356,10 @@ if __name__ == "__main__":
                     "dev_report": pending_dev_report
                 })
 
+                # Update last_applied_dev_report with the full apply results
+                last_applied_dev_report = pending_dev_report
+                pending_dev_report = None
+                continue
                 # Clear pending state after handling
                 pending_dev_report = None
                 continue
@@ -332,6 +373,15 @@ if __name__ == "__main__":
             print("Please answer: yes or no")
             continue
 
+        # Check for commit command (needs access to last_applied_dev_report)
+        if text.lower().startswith("dev: commit with message"):
+            # Temporarily set pending_dev_report for the command handler
+            pending_dev_report = last_applied_dev_report
+            msg = handle_command(text, memory)
+            pending_dev_report = None
+            if msg:
+                print(msg)
+                continue
         # -------------------
         # B) NORMAL COMMANDS
         # -------------------
