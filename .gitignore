@@ -23,3 +23,4 @@ venv/
 # Runtime memory/state/logs (keep structure but not content)
 memory/state.json
 memory/*.log
+memory/state.local.json
