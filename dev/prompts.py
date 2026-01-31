@@ -71,6 +71,8 @@ def build_author_prompt(request: str, context: Any) -> str:
         "- Use exact paths that exist in the repo.\n"
         "- The patch must apply cleanly to the provided file contents.\n"
         "- No prose before or after the diff.\n"
+        "- When editing an existing block, COPY the exact original lines from the provided file contents.\n"
+        "- Do not paraphrase existing strings—match them exactly so the patch applies.\n"
         "\n"
         "IMPORTANT PATCH RULES:\n"
         "- Keep changes minimal and directly related to the request.\n"
