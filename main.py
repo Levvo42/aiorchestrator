@@ -74,21 +74,23 @@ def handle_command(text: str, memory: MemoryStore) -> Optional[str]:
     if t.lower() == "help":
         return (
             "Available commands:\n"
-            "- Help\n"
-            "- Show Settings\n"
-            "- Show Judge\n"
-            "- Set Judge: <provider>\n"
-            "- Set Judge Mode: auto | fixed\n"
-            "- Set Verbosity: full | normal | final\n"
+            "General:\n"
+            "  Help\n"
+            "  Show Settings\n"
+            "  Show Judge\n"
+            "  Set Judge: <provider>\n"
+            "  Set Judge Mode: auto | fixed\n"
+            "  Set Verbosity: full | normal | final\n"
+            "\nDev workflow:\n"
+            "  Dev: <request>\n"
+            "  Show Dev Settings\n"
+            "  Set Dev Mode: auto | fixed\n"
+            "  Set Dev Judge: <provider>\n"
+            "  Set Dev Authors: a, b, c\n"
             "\nExamples:\n"
             "  Set Judge: gemini\n"
             "  Set Verbosity: final\n"
-            "  Dev: < request >\n"
-
-            " Show Dev Settings \n"
-            " Set Dev Mode: auto | fixed \n"
-            " Set Dev Judge: < provider > \n"
-            " Set Dev Authors: a, b, c \n"
+            "  Dev: add logging to router\n"
         )
 
     # Show current judge configuration

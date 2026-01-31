@@ -16,6 +16,7 @@ Judge contract (STRICT JSON):
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import re
 import subprocess
 from typing import Any, Dict, List, Optional, Tuple
@@ -447,6 +448,7 @@ def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
         compile_ok, compile_out = py_compile_files(repo_root=repo_root, changed_paths=changed_files)
         tests_ok, tests_out, tests_ran = run_tests_if_available(repo_root=repo_root)
 
+        # If validation fails, rollback
         report["apply"]["tests_ran"] = tests_ran
         report["apply"]["tests_ok"] = tests_ok
         report["apply"]["tests_output"] = tests_out
@@ -458,6 +460,26 @@ def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
             + "\n\n=== tests ===\n"
             + (tests_out or "")
         ).strip()
+
+        if not report["apply"]["validation_ok"]:
+            # Rollback: restore files from backups
+            rollback_errors = []
+            for rel_path, backup_content in backups.items():
+                try:
+                    target = Path(repo_root) / rel_path
+                    target.write_text(backup_content, encoding="utf-8")
+                except Exception as e:
+                    rollback_errors.append(f"{rel_path}: {e}")
+
+            report["apply"]["applied"] = False
+            error_msg = (
+                "Validation failed after apply. Files have been restored from backups.\n"
+                f"Validation output:\n{report['apply']['validation_output']}"
+            )
+            if rollback_errors:
+                error_msg += f"\n\nRollback errors:\n" + "\n".join(rollback_errors)
+
+            report["apply"]["error"] = error_msg
 
         return report
 
