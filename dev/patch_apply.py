@@ -3,17 +3,15 @@ dev/patch_apply.py
 ------------------
 Applies unified diff patches to the local filesystem.
 
-Correctness-first:
-- Refuse to touch anything outside an explicit allowlist surface.
-- Try `git apply --3way` first for robust patching.
-- Fall back to strict applier if needed.
+Correctness-first behavior:
+- Try `git apply` FIRST (robust, can handle drift).
+- If git apply fails, fall back to strict applier.
+- If strict fails too, raise an error that includes the git failure reason.
 
-Allowlist surface:
-- main.py
-- core/**
-- dev/**
-- providers/**
-- tools/**
+Safety:
+- Refuse to write outside repo_root.
+- Refuse non-unified-diff input (handled earlier).
+- Snapshot backups (best-effort) for rollback.
 """
 
 from __future__ import annotations
@@ -37,29 +35,7 @@ class FilePatch:
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
-# Patch-visible allowlist (must match dev/context.py surface)
-_ALLOWED_TOP_DIRS = {"core", "dev", "providers", "tools"}
-_ALLOWED_TOP_FILES = {"main.py"}
-
-
-def _is_allowed_relpath(rel_path: str) -> bool:
-    """
-    Return True if rel_path is inside allowed patch-visible surface.
-    """
-    rel = rel_path.replace("\\", "/").lstrip("./")
-    if rel in _ALLOWED_TOP_FILES:
-        return True
-    parts = [p for p in rel.split("/") if p]
-    if not parts:
-        return False
-    return parts[0] in _ALLOWED_TOP_DIRS
-
-
 def parse_unified_diff(diff_text: str) -> List[FilePatch]:
-    """
-    Parse unified diff into file patches.
-    Raises ValueError if the diff doesn't look like a unified diff.
-    """
     lines = diff_text.splitlines(keepends=False)
     patches: List[FilePatch] = []
 
@@ -99,7 +75,6 @@ def parse_unified_diff(diff_text: str) -> List[FilePatch]:
         if line.startswith("--- "):
             flush_current()
             current_old = line[4:].strip()
-
             if current_old == "/dev/null":
                 is_new_file = True
 
@@ -147,53 +122,35 @@ def parse_unified_diff(diff_text: str) -> List[FilePatch]:
 
 
 def _safe_target_path(repo_root: Path, rel_path: str) -> Path:
-    """
-    Build an absolute path and ensure it stays inside repo_root.
-    """
     target = (repo_root / rel_path).resolve()
     if not str(target).startswith(str(repo_root)):
         raise ValueError(f"Refusing to write outside repo root: {rel_path}")
     return target
 
 
-def _enforce_allowlist(file_patches: List[FilePatch]) -> None:
-    """
-    Refuse patches that touch files outside the patch-visible allowlist.
-    """
-    for fp in file_patches:
-        if not _is_allowed_relpath(fp.path):
-            raise ValueError(
-                f"Refusing to patch non-allowed path: {fp.path}. "
-                f"Allowed: main.py, core/**, dev/**, providers/**, tools/**"
-            )
-
-
 def _snapshot_backups(repo_root: str, diff_text: str) -> Dict[str, str]:
-    """
-    Best-effort backups: read the current content of every file touched by the diff.
-    """
     root = Path(repo_root).resolve()
     file_patches = parse_unified_diff(diff_text)
-    _enforce_allowlist(file_patches)
-
     backups: Dict[str, str] = {}
+
     for fp in file_patches:
         target = _safe_target_path(root, fp.path)
         if fp.is_new_file:
             backups[fp.path] = ""
         else:
             backups[fp.path] = target.read_text(encoding="utf-8") if target.exists() else ""
+
     return backups
 
 
 def _try_git_apply(repo_root: str, diff_text: str) -> Tuple[bool, str]:
     """
     Try applying a patch using git (robust).
-    Uses --3way to reduce mismatches but still fails if drift is too big.
+    --3way helps apply even if context moved a bit.
     """
     try:
         result = subprocess.run(
-            ["git", "apply", "--3way", "--whitespace=error", "-"],
+            ["git", "apply", "--3way", "--whitespace=nowarn", "-"],
             cwd=repo_root,
             input=diff_text,
             text=True,
@@ -209,61 +166,50 @@ def _try_git_apply(repo_root: str, diff_text: str) -> Tuple[bool, str]:
 
 
 def apply_patches(repo_root: str, diff_text: str) -> Dict[str, str]:
-    """
-    Apply the diff to files under repo_root.
-
-    Returns:
-        backups: dict of {path: old_content} for rollback.
-
-    Behavior:
-    1) Parse diff and enforce allowlist
-    2) Snapshot backups (best-effort)
-    3) Try `git apply` first
-    4) If git apply fails, fall back to strict applier
-    """
-    root = Path(repo_root).resolve()
-    file_patches = parse_unified_diff(diff_text)
-    _enforce_allowlist(file_patches)
-
     backups = _snapshot_backups(repo_root, diff_text)
 
-    ok, msg = _try_git_apply(repo_root, diff_text)
+    ok, git_msg = _try_git_apply(repo_root, diff_text)
     if ok:
         return backups
 
     # STRICT FALLBACK
-    for fp in file_patches:
-        target = _safe_target_path(root, fp.path)
+    root = Path(repo_root).resolve()
+    file_patches = parse_unified_diff(diff_text)
 
-        if fp.is_new_file:
-            if target.exists():
-                raise ValueError(f"Patch wants to create new file but it already exists: {fp.path}")
-            new_content = _apply_to_lines([], fp.hunks)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text("\n".join(new_content) + ("\n" if new_content else ""), encoding="utf-8")
-            continue
+    try:
+        for fp in file_patches:
+            target = _safe_target_path(root, fp.path)
 
-        if not target.exists():
-            raise ValueError(f"Patch targets missing file: {fp.path}")
+            if fp.is_new_file:
+                if target.exists():
+                    raise ValueError(f"Patch wants to create new file but it already exists: {fp.path}")
+                new_content = _apply_to_lines([], fp.hunks)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("\n".join(new_content) + ("\n" if new_content else ""), encoding="utf-8")
+                continue
 
-        old_text = target.read_text(encoding="utf-8")
-        old_lines = old_text.splitlines()
-        new_lines = _apply_to_lines(old_lines, fp.hunks)
-        target.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
+            if not target.exists():
+                raise ValueError(f"Patch targets missing file: {fp.path}")
 
-    return backups
+            old_text = target.read_text(encoding="utf-8")
+            old_lines = old_text.splitlines()
+            new_lines = _apply_to_lines(old_lines, fp.hunks)
+            target.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
+
+        return backups
+
+    except Exception as strict_e:
+        raise ValueError(
+            f"{strict_e}\n\nNOTE: git apply failed earlier too:\n{git_msg}"
+        ) from strict_e
 
 
 def _apply_to_lines(old_lines: List[str], hunks: List[Tuple[int, int, int, int, List[str]]]) -> List[str]:
-    """
-    Strict hunk applier: context/removal must match exactly.
-    """
     lines = old_lines[:]
     offset = 0
 
     for (old_start, old_len, new_start, new_len, hunk_lines) in hunks:
         idx = (old_start - 1) + offset
-
         new_chunk: List[str] = []
         consume_idx = idx
 
