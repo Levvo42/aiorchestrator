@@ -82,6 +82,11 @@ def _validate_unified_diff(diff_text: str) -> Tuple[bool, str]:
     if not any(l.startswith("diff --git ") for l in lines):
         return False, "Patch missing 'diff --git' header."
 
+    # Reject patches with leading garbage (common LLM failure mode)
+    first_diff_idx = next((i for i, l in enumerate(lines) if l.startswith("diff --git ")), None)
+    if first_diff_idx and first_diff_idx > 0:
+        return False, f"Patch has {first_diff_idx} lines of garbage before first 'diff --git' header."
+
     i = 0
     blocks = 0
 
