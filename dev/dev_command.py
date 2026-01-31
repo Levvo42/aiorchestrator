@@ -10,21 +10,15 @@ Two-step flow (matches main.py):
 1) run_dev_request(...) proposes a patch (does NOT apply).
 2) apply_dev_patch(repo_root=".", report=...) applies only after user confirmation.
 
-Report schema returned by run_dev_request is designed to be consumed directly by main.py:
-- report["policy"]["mode"]
-- report["policy"]["author_providers"]
-- report["policy"]["judge_provider"]
-- report["policy"]["reason"]
-- report["judge"]["rationale"]
-- report["chosen_patch"]
-- report["base_commit"]
-
-apply_dev_patch mutates and returns the same report with:
-- report["apply"] filled with results
+Judge contract (dev/prompts.py):
+- build_judge_prompt(request, context, patches) -> prompt
+- Judge returns STRICT JSON:
+    {"patch_index": <int>, "rationale": "<short text>"}
 """
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -91,7 +85,7 @@ def _require_head(repo_root: str, expected_head: str, phase: str) -> None:
 
 
 # -----------------------------
-# Patch text helpers
+# Patch helpers
 # -----------------------------
 
 _DIFF_START_RE = re.compile(r"^(diff --git|---\s|\+\+\+\s|@@\s)", re.MULTILINE)
@@ -110,14 +104,51 @@ def _looks_like_unified_diff(text: str) -> bool:
     return bool(text) and isinstance(text, str) and bool(_DIFF_START_RE.search(text))
 
 
-def _choose_first_valid_patch(candidates: List[Dict[str, Any]]) -> Tuple[str, str]:
-    """Fallback: return first candidate patch that looks like a unified diff."""
-    successful = [c for c in candidates if c.get("success") and isinstance(c.get("patch"), str)]
-    for item in successful:
-        patch_text = _strip_markdown_fences(item["patch"])
-        if _looks_like_unified_diff(patch_text):
-            return patch_text, "Fallback: selected first candidate patch that looks like a unified diff."
+def _first_valid_patch_from_authors(author_outputs: List[Dict[str, Any]]) -> Tuple[str, str]:
+    """Fallback: choose first author patch that looks like a unified diff."""
+    for item in author_outputs:
+        if not item.get("success"):
+            continue
+        patch = _strip_markdown_fences(item.get("patch", "") or "")
+        if _looks_like_unified_diff(patch):
+            return patch, "Fallback: selected first candidate patch that looks like a unified diff."
     return "", "Fallback: no candidate patch looked like a unified diff; no patch selected."
+
+
+def _extract_author_patches(author_outputs: List[Dict[str, Any]]) -> List[str]:
+    """Return list of patch texts (same ordering as author_outputs, but only successful ones)."""
+    patches: List[str] = []
+    for item in author_outputs:
+        if item.get("success") and isinstance(item.get("patch"), str):
+            patches.append(_strip_markdown_fences(item["patch"]))
+    return patches
+
+
+def _parse_judge_json(text: str) -> Tuple[int, str]:
+    """
+    Parse judge output JSON: {"patch_index": int, "rationale": str}
+    Raises ValueError on invalid format.
+    """
+    raw = (text or "").strip()
+    data = json.loads(raw)
+
+    if not isinstance(data, dict):
+        raise ValueError("Judge output JSON was not an object.")
+
+    if "patch_index" not in data:
+        raise ValueError("Judge JSON missing 'patch_index'.")
+    if "rationale" not in data:
+        raise ValueError("Judge JSON missing 'rationale'.")
+
+    idx = data["patch_index"]
+    rationale = data["rationale"]
+
+    if not isinstance(idx, int):
+        raise ValueError("'patch_index' must be an integer.")
+    if not isinstance(rationale, str):
+        raise ValueError("'rationale' must be a string.")
+
+    return idx, rationale.strip()
 
 
 # -----------------------------
@@ -142,7 +173,7 @@ def run_dev_request(
             "judge_provider": None,
             "reason": "",
         },
-        "authors": [],  # list of {provider, success, patch|error}
+        "authors": [],
         "judge": {
             "provider": None,
             "success": False,
@@ -167,10 +198,8 @@ def run_dev_request(
     _require_head(repo_root, base_commit, phase="pre-context")
     _require_clean_tree(repo_root, phase="pre-context")
 
-    # Context (already filtered by dev/context.py)
     context = build_context_bundle(repo_root=repo_root, request=request)
 
-    # Decide dev policy
     policy = DevPolicy(capabilities)
     provider_stats = memory.get_provider_stats()
 
@@ -222,39 +251,53 @@ def run_dev_request(
 
     report["authors"] = author_outputs
 
-    # 2) Judge/select
+    # Prepare patch list for judge (successful patches only, in order)
+    patches = _extract_author_patches(author_outputs)
+
+    # If we have no usable patches, stop early with empty chosen_patch
+    if not patches:
+        report["judge"] = {
+            "provider": judge_provider,
+            "success": False,
+            "rationale": "No valid author patches available to judge.",
+        }
+        report["chosen_patch"] = ""
+        return report
+
+    # 2) Judge/select by index (STRICT JSON)
     chosen_patch = ""
     rationale = ""
 
     judge_client = provider_map.get(judge_provider) if judge_provider else None
     if judge_client:
         try:
-            judge_prompt = build_judge_prompt(request=request, context=context, candidates=author_outputs)
+            judge_prompt = build_judge_prompt(request=request, context=context, patches=patches)
             judge_text = _strip_markdown_fences(judge_client.generate(judge_prompt))
 
-            if _looks_like_unified_diff(judge_text):
-                chosen_patch = judge_text
-                rationale = f"Judge({judge_provider}) returned a unified diff directly."
-            else:
-                chosen_patch, rationale = _choose_first_valid_patch(author_outputs)
+            idx, rationale = _parse_judge_json(judge_text)
+            if idx < 0 or idx >= len(patches):
+                raise ValueError(f"Judge patch_index out of range: {idx} (0..{len(patches)-1})")
+
+            chosen_patch = patches[idx]
 
             report["judge"] = {
                 "provider": judge_provider,
                 "success": True,
-                "rationale": rationale,
+                "rationale": rationale or "Judge selected a patch.",
             }
             memory.update_provider_stats(judge_provider, success=True)
 
         except Exception as e:
-            chosen_patch, fallback_reason = _choose_first_valid_patch(author_outputs)
+            chosen_patch, fallback_reason = _first_valid_patch_from_authors(author_outputs)
             report["judge"] = {
                 "provider": judge_provider,
                 "success": False,
                 "rationale": f"Judge failed: {e}. {fallback_reason}",
             }
-            memory.update_provider_stats(judge_provider, success=False)
+            if judge_provider:
+                memory.update_provider_stats(judge_provider, success=False)
     else:
-        chosen_patch, rationale = _choose_first_valid_patch(author_outputs)
+        chosen_patch, rationale = _first_valid_patch_from_authors(author_outputs)
         report["judge"] = {
             "provider": judge_provider,
             "success": False,
@@ -281,7 +324,6 @@ def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
     """
     repo_root = str(Path(repo_root).resolve())
 
-    # Ensure apply block exists
     report.setdefault("apply", {})
     report["apply"].setdefault("attempted", False)
     report["apply"].setdefault("applied", False)
