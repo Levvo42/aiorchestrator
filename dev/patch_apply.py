@@ -3,15 +3,15 @@ dev/patch_apply.py
 ------------------
 Applies unified diff patches to the local filesystem.
 
-Correctness-first behavior:
-- Try `git apply` FIRST (robust, can handle drift).
-- If git apply fails, fall back to strict applier.
-- If strict fails too, raise an error that includes the git failure reason.
+Correctness-first:
+- Refuse to apply malformed patches.
+- Use `git apply --check` to validate patch format BEFORE applying.
+- If check passes, apply via `git apply --3way`.
+- Only if git is unavailable do we fall back to the strict applier.
 
-Safety:
-- Refuse to write outside repo_root.
-- Refuse non-unified-diff input (handled earlier).
-- Snapshot backups (best-effort) for rollback.
+Why:
+- LLM diffs can be malformed ("corrupt patch").
+- Strict fallback cannot safely recover from malformed diffs.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ class FilePatch:
     path: str
     old_path: Optional[str]
     new_path: Optional[str]
-    hunks: List[Tuple[int, int, int, int, List[str]]]  # (old_start, old_len, new_start, new_len, lines)
+    hunks: List[Tuple[int, int, int, int, List[str]]]
     is_new_file: bool
 
 
@@ -132,51 +132,65 @@ def _snapshot_backups(repo_root: str, diff_text: str) -> Dict[str, str]:
     root = Path(repo_root).resolve()
     file_patches = parse_unified_diff(diff_text)
     backups: Dict[str, str] = {}
-
     for fp in file_patches:
         target = _safe_target_path(root, fp.path)
-        if fp.is_new_file:
-            backups[fp.path] = ""
-        else:
-            backups[fp.path] = target.read_text(encoding="utf-8") if target.exists() else ""
-
+        backups[fp.path] = "" if fp.is_new_file else (target.read_text(encoding="utf-8") if target.exists() else "")
     return backups
 
 
-def _try_git_apply(repo_root: str, diff_text: str) -> Tuple[bool, str]:
+def _git_apply_check(repo_root: str, diff_text: str) -> Tuple[bool, str]:
     """
-    Try applying a patch using git (robust).
-    --3way helps apply even if context moved a bit.
+    Validate patch format and applicability without applying.
     """
-    try:
-        result = subprocess.run(
-            ["git", "apply", "--3way", "--whitespace=nowarn", "-"],
-            cwd=repo_root,
-            input=diff_text,
-            text=True,
-            capture_output=True,
-        )
-        if result.returncode == 0:
-            return True, "git apply succeeded"
-        return False, (result.stderr or result.stdout or "git apply failed")
-    except FileNotFoundError:
-        return False, "git not found on PATH"
-    except Exception as e:
-        return False, f"git apply exception: {e}"
+    result = subprocess.run(
+        ["git", "apply", "--check", "--3way", "--whitespace=nowarn", "-"],
+        cwd=repo_root,
+        input=diff_text,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        return True, "git apply --check ok"
+    return False, (result.stderr or result.stdout or "git apply --check failed")
+
+
+def _git_apply(repo_root: str, diff_text: str) -> Tuple[bool, str]:
+    result = subprocess.run(
+        ["git", "apply", "--3way", "--whitespace=nowarn", "-"],
+        cwd=repo_root,
+        input=diff_text,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        return True, "git apply ok"
+    return False, (result.stderr or result.stdout or "git apply failed")
 
 
 def apply_patches(repo_root: str, diff_text: str) -> Dict[str, str]:
-    backups = _snapshot_backups(repo_root, diff_text)
+    """
+    Apply diff text. Returns backups for rollback.
+    """
+    # Prefer git (format + applicability check) for correctness.
+    try:
+        ok, msg = _git_apply_check(repo_root, diff_text)
+        if not ok:
+            raise ValueError(f"Refusing to apply invalid patch:\n{msg}")
 
-    ok, git_msg = _try_git_apply(repo_root, diff_text)
-    if ok:
+        backups = _snapshot_backups(repo_root, diff_text)
+
+        ok2, msg2 = _git_apply(repo_root, diff_text)
+        if not ok2:
+            raise ValueError(f"git apply failed after check passed (unexpected):\n{msg2}")
+
         return backups
 
-    # STRICT FALLBACK
-    root = Path(repo_root).resolve()
-    file_patches = parse_unified_diff(diff_text)
+    except FileNotFoundError:
+        # git not available -> strict fallback
+        backups = _snapshot_backups(repo_root, diff_text)
+        root = Path(repo_root).resolve()
+        file_patches = parse_unified_diff(diff_text)
 
-    try:
         for fp in file_patches:
             target = _safe_target_path(root, fp.path)
 
@@ -192,16 +206,10 @@ def apply_patches(repo_root: str, diff_text: str) -> Dict[str, str]:
                 raise ValueError(f"Patch targets missing file: {fp.path}")
 
             old_text = target.read_text(encoding="utf-8")
-            old_lines = old_text.splitlines()
-            new_lines = _apply_to_lines(old_lines, fp.hunks)
+            new_lines = _apply_to_lines(old_text.splitlines(), fp.hunks)
             target.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
 
         return backups
-
-    except Exception as strict_e:
-        raise ValueError(
-            f"{strict_e}\n\nNOTE: git apply failed earlier too:\n{git_msg}"
-        ) from strict_e
 
 
 def _apply_to_lines(old_lines: List[str], hunks: List[Tuple[int, int, int, int, List[str]]]) -> List[str]:
@@ -243,10 +251,7 @@ def _apply_to_lines(old_lines: List[str], hunks: List[Tuple[int, int, int, int, 
             else:
                 raise ValueError(f"Unknown hunk tag '{tag}' in line: {hl}")
 
-        before = lines[:idx]
-        after = lines[consume_idx:]
-        lines = before + new_chunk + after
-
+        lines = lines[:idx] + new_chunk + lines[consume_idx:]
         consumed_old = consume_idx - idx
         offset += (len(new_chunk) - consumed_old)
 
