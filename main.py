@@ -339,8 +339,8 @@ if __name__ == "__main__":
 
             print("\n=== DEV POLICY ===")
             print(f"Mode: {report['policy']['mode']}")
-            print(f"Authors: {report['policy']['authors']}")
-            print(f"Judge: {report['policy']['judge']}")
+            print(f"Authors: {report['policy'].get('author_providers', [])}")
+            print(f"Judge: {report['policy'].get('judge_provider')}")
             print(f"Reason: {report['policy']['reason']}")
 
             print("\n=== DEV JUDGE RATIONALE ===")
