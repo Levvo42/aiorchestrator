@@ -248,7 +248,7 @@ if __name__ == "__main__":
     load_dotenv()
 
     capabilities = load_capabilities()
-    memory = MemoryStore("memory/state.json")
+    memory = MemoryStore(state_path="memory/state.local.json", seed_path="memory/state.json")
     agent = Agent(capabilities=capabilities, memory=memory)
     # Holds a dev report that has been proposed but not yet confirmed/applied.
     pending_dev_report = None
