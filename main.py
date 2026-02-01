@@ -186,6 +186,43 @@ def handle_command(text: str, memory: MemoryStore) -> Optional[str]:
     return None
 
 
+def _safe_input(prompt: str) -> Optional[str]:
+    try:
+        return input(prompt)
+    except EOFError:
+        print("\nNo interactive input available (EOF).")
+        return None
+
+
+def _prompt_yes_no(prompt: str) -> bool:
+    while True:
+        ans = _safe_input(prompt)
+        if ans is None:
+            return False
+        a = ans.strip().lower()
+        if a in ("y", "yes"):
+            return True
+        if a in ("n", "no"):
+            return False
+        print("Please answer: yes or no")
+
+
+def _run_git(repo_root: str, args):
+    try:
+        completed = subprocess.run(
+            ["git"] + args,
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception as e:
+        return False, str(e)
+    if completed.returncode != 0:
+        return False, (completed.stderr or completed.stdout or "").strip()
+    return True, (completed.stdout or "").strip()
+
+
 def print_run_summary(run: dict, verbosity: str) -> None:
     """
     Print output based on verbosity.
@@ -358,9 +395,43 @@ if __name__ == "__main__":
 
                 # Update last_applied_dev_report with the full apply results
                 last_applied_dev_report = pending_dev_report
-                pending_dev_report = None
-                continue
-                # Clear pending state after handling
+
+                # Offer commit + push after successful apply + validation
+                if pending_dev_report["apply"]["applied"] and pending_dev_report["apply"]["validation_ok"]:
+                    if _prompt_yes_no("Commit and push to GitHub? (yes/no) "):
+                        commit_msg = _safe_input("Commit message: ")
+                        if commit_msg is None:
+                            pass
+                        else:
+                            commit_msg = commit_msg.strip()
+                            if not commit_msg:
+                                print("Commit message cannot be empty.")
+                            else:
+                                changed_files = pending_dev_report["apply"].get("changed_files", []) or []
+                                if not changed_files:
+                                    print("No changed files to commit.")
+                                else:
+                                    ok, out = _run_git(".", ["add", "--"] + changed_files)
+                                    if not ok:
+                                        print(f"Git add failed: {out}")
+                                    else:
+                                        ok, out = _run_git(".", ["commit", "-m", commit_msg])
+                                        if not ok:
+                                            print(f"Git commit failed: {out}")
+                                        else:
+                                            ok, out = _run_git(".", ["show", "--name-only", "--stat", "HEAD"])
+                                            if not ok:
+                                                print(f"Git show failed: {out}")
+                                            else:
+                                                if out:
+                                                    print(out)
+                                                if _prompt_yes_no("Push now? (yes/no) "):
+                                                    ok, out = _run_git(".", ["push"])
+                                                    if not ok:
+                                                        print(f"Git push failed: {out}")
+                                                    elif out:
+                                                        print(out)
+
                 pending_dev_report = None
                 continue
 
