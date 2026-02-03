@@ -24,7 +24,7 @@ def _run(repo_root: str, args: List[str], diff_text: str) -> subprocess.Complete
         ["git", "apply"] + args,
         cwd=repo_root,
         input=diff_text,
-        text=True,
+        encoding="utf-8",
         capture_output=True,
         check=False,
     )
