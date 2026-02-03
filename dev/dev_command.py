@@ -142,6 +142,24 @@ def _validate_unified_diff(diff_text: str) -> Tuple[bool, str]:
     return True, "OK"
 
 
+def _extract_changed_files(diff_text: str) -> List[str]:
+    changed: List[str] = []
+    for line in (diff_text or "").splitlines():
+        m = _DIFF_GIT_RE.match(line)
+        if m:
+            b_path = m.group(2)
+            if b_path:
+                changed.append(b_path)
+    # Deduplicate while preserving order
+    seen = set()
+    uniq: List[str] = []
+    for p in changed:
+        if p not in seen:
+            uniq.append(p)
+            seen.add(p)
+    return uniq
+
+
 def _extract_patch_text(patch_item: Any) -> str:
     if isinstance(patch_item, dict):
         return str(patch_item.get("patch", "")).strip()
@@ -444,14 +462,24 @@ def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
     report["apply"]["attempted"] = True
 
     try:
+        changed_files = _extract_changed_files(patch)
         backups = apply_patches(repo_root=repo_root, diff_text=patch)
-        changed_files = list(backups.keys())
+        if not changed_files:
+            changed_files = list(backups.keys())
 
         report["apply"]["changed_files"] = changed_files
         report["apply"]["applied"] = True
 
-        compile_ok, compile_out = py_compile_files(repo_root=repo_root, changed_paths=changed_files)
-        tests_ok, tests_out, tests_ran = run_tests_if_available(repo_root=repo_root)
+        python_files = [p for p in changed_files if p.endswith(".py")]
+        if python_files:
+            compile_ok, compile_out = py_compile_files(repo_root=repo_root, changed_paths=python_files)
+        else:
+            compile_ok, compile_out = True, "Skipped py_compile (no .py files changed)."
+
+        if compile_ok:
+            tests_ok, tests_out, tests_ran = run_tests_if_available(repo_root=repo_root)
+        else:
+            tests_ok, tests_out, tests_ran = True, "Skipped tests because py_compile failed.", False
 
         # If validation fails, rollback
         report["apply"]["tests_ran"] = tests_ran
@@ -473,6 +501,19 @@ def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
                 try:
                     target = Path(repo_root) / rel_path
                     target.write_text(backup_content, encoding="utf-8")
+                except Exception as e:
+                    rollback_errors.append(f"{rel_path}: {e}")
+            # Remove newly added files that had no backup
+            for rel_path in changed_files:
+                if rel_path in backups:
+                    continue
+                try:
+                    target = Path(repo_root) / rel_path
+                    if target.exists():
+                        if target.is_file():
+                            target.unlink()
+                        elif target.is_dir():
+                            target.rmdir()
                 except Exception as e:
                     rollback_errors.append(f"{rel_path}: {e}")
 
