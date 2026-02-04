@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from dev.context import build_context_bundle
 from dev.policy import DevPolicy
-from dev.prompts import build_author_prompt, build_judge_prompt
+from dev.prompts import build_author_prompt, build_fix_author_prompt, build_judge_prompt
 from dev.patch_apply import apply_patches
 from dev.validate import py_compile_files, run_tests_if_available
 
@@ -426,6 +426,69 @@ def run_dev_request(
     }
 
     return report
+
+def run_dev_fix_request(
+    repo_root: str,
+    failed_report: Dict[str, Any],
+    capabilities: dict,
+    memory: Any,
+    provider_map: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Re-propose a patch after a failed apply attempt."""
+
+    original_request = str(failed_report.get("request", "")).strip()
+    failed_patch = str(failed_report.get("chosen_patch", "")).strip()
+    apply_error = str((failed_report.get("apply", {}) or {}).get("error", "")).strip()
+
+    context = build_context_bundle(repo_root=repo_root, request=original_request)
+
+    policy = DevPolicy(capabilities)
+    provider_stats = memory.get_provider_stats()
+
+    decision = policy.decide(
+        provider_stats=provider_stats,
+        settings={},
+        determinism_key=f"{_git_head(repo_root)}\nFIX_APPLY\n{original_request}\n{apply_error[:300]}",
+    )
+
+    author_prompt = build_fix_author_prompt(
+        request=original_request,
+        context=context,
+        failed_patch=failed_patch,
+        apply_error=apply_error,
+    )
+
+    author_outputs = []
+    for provider_name in decision.author_providers:
+        client = provider_map.get(provider_name)
+        if not client:
+            continue
+        try:
+            patch = _strip_markdown_fences(client.generate(author_prompt))
+            ok, _ = _validate_unified_diff(patch)
+            if ok:
+                author_outputs.append(patch)
+        except Exception:
+            pass
+
+    chosen_patch = author_outputs[0] if author_outputs else ""
+
+    return {
+        "request": original_request,
+        "context": context,
+        "policy": {
+            "mode": decision.mode,
+            "authors": decision.author_providers,
+            "judge": decision.judge_provider,
+            "reason": "FIX_APPLY",
+        },
+        "chosen_patch": chosen_patch,
+        "apply": {
+            "attempted": False,
+            "applied": False,
+            "error": "",
+        },
+    }
 
 
 def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:

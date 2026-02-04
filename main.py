@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Optional
 from core.agent import Agent
 from core.memory import MemoryStore
-from dev.dev_command import run_dev_request, apply_dev_patch
+from dev.dev_command import run_dev_request, run_dev_fix_request, apply_dev_patch
 
 
 def load_capabilities(path: str = "core/capabilities.json") -> dict:
@@ -356,17 +356,36 @@ if __name__ == "__main__":
             if answer in ("y", "yes"):
                 # Store the report before applying so we can reference it for commits
                 last_applied_dev_report = pending_dev_report
-                
+
                 pending_dev_report = apply_dev_patch(repo_root=".", report=pending_dev_report)
 
                 print("\n=== APPLY RESULT ===")
                 print(f"Applied: {pending_dev_report['apply']['applied']}")
-                if pending_dev_report["apply"]["error"]:
+                if pending_dev_report["apply"].get("error"):
                     print(f"Error: {pending_dev_report['apply']['error']}")
                 else:
-                    print(f"Changed files: {pending_dev_report['apply']['changed_files']}")
-                    print(f"Validation OK: {pending_dev_report['apply']['validation_ok']}")
-                    print(f"Validation output:\n{pending_dev_report['apply']['validation_output']}")
+                    print(f"Changed files: {pending_dev_report['apply'].get('changed_files')}")
+                    print(f"Validation OK: {pending_dev_report['apply'].get('validation_ok')}")
+                    print(f"Validation output:\n{pending_dev_report['apply'].get('validation_output')}")
+
+                # ✅ If apply failed, offer auto-fix + re-propose BEFORE doing anything else.
+                if not pending_dev_report["apply"].get("applied"):
+                    if _prompt_yes_no("Attempt auto-fix and re-propose a patch? (yes/no) "):
+                        fix_report = run_dev_fix_request(
+                            repo_root=".",
+                            failed_report=pending_dev_report,
+                            capabilities=capabilities,
+                            memory=memory,
+                            provider_map=agent.provider_map,
+                        )
+
+                        print("\n=== PROPOSED FIX PATCH ===")
+                        print(fix_report.get("chosen_patch") or "(no patch produced)")
+
+                        # Replace pending report with the new proposal and go back to yes/no apply.
+                        pending_dev_report = fix_report
+                        print("\nApply patch? (yes/no):")
+                        continue
 
                 # Update provider stats ONLY after an explicit apply confirmation.
                 # This keeps the proposal step side-effect free and reproducible.
@@ -397,7 +416,7 @@ if __name__ == "__main__":
                 last_applied_dev_report = pending_dev_report
 
                 # Offer commit + push after successful apply + validation
-                if pending_dev_report["apply"]["applied"] and pending_dev_report["apply"]["validation_ok"]:
+                if pending_dev_report["apply"].get("applied") and pending_dev_report["apply"].get("validation_ok"):
                     if _prompt_yes_no("Commit and push to GitHub? (yes/no) "):
                         commit_msg = _safe_input("Commit message: ")
                         if commit_msg is None:
@@ -444,15 +463,6 @@ if __name__ == "__main__":
             print("Please answer: yes or no")
             continue
 
-        # Check for commit command (needs access to last_applied_dev_report)
-        if text.lower().startswith("dev: commit with message"):
-            # Temporarily set pending_dev_report for the command handler
-            pending_dev_report = last_applied_dev_report
-            msg = handle_command(text, memory)
-            pending_dev_report = None
-            if msg:
-                print(msg)
-                continue
         # -------------------
         # B) NORMAL COMMANDS
         # -------------------

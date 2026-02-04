@@ -86,6 +86,58 @@ def build_author_prompt(request: str, context: Any) -> str:
         f"{context_text}\n"
     )
 
+def build_fix_author_prompt(
+    request: str,
+    context: Any,
+    failed_patch: str,
+    apply_error: str,
+) -> str:
+    """Build a repair prompt after a patch failed to apply."""
+
+    context_text = _context_to_text(context)
+
+    failed_patch = (failed_patch or "").strip()
+    apply_error = (apply_error or "").strip()
+
+    return (
+        "You are a senior software engineer.\n"
+        "A previously proposed unified diff FAILED to apply via `git apply`.\n"
+        "You will receive: (1) the original request, (2) the current repo context, "
+        "(3) the failed patch, and (4) the `git apply` error output.\n"
+        "\n"
+        "TASK:\n"
+        "- Produce ONE NEW unified diff patch that implements the ORIGINAL request.\n"
+        "- The NEW patch MUST apply cleanly to the CURRENT context.\n"
+        "- Do NOT output explanations. Output ONLY the diff.\n"
+        "\n"
+        "STRICT OUTPUT RULES:\n"
+        "- Output ONLY a unified git-style diff suitable for `git apply`.\n"
+        "- No markdown fences. No prose.\n"
+        "- Omit all 'index ...' lines entirely.\n"
+        "- Every file header must look like:\n"
+        "  diff --git a/path b/path\n"
+        "  --- a/path\n"
+        "  +++ b/path\n"
+        "- Use exact paths that exist in the repo.\n"
+        "- Use exact, literal original lines from the provided file contents.\n"
+        "\n"
+        "IMPORTANT:\n"
+        "- Prefer minimal edits over refactors.\n"
+        "- Rebuild hunks if the previous patch guessed context incorrectly.\n"
+        "\n"
+        "=== ORIGINAL REQUEST ===\n"
+        f"{request.strip()}\n"
+        "\n"
+        "=== GIT APPLY ERROR OUTPUT ===\n"
+        f"{apply_error}\n"
+        "\n"
+        "=== FAILED PATCH (REFERENCE ONLY) ===\n"
+        f"{failed_patch}\n"
+        "\n"
+        "=== CURRENT CONTEXT ===\n"
+        f"{context_text}\n"
+    )
+
 
 def build_judge_prompt(request: str, context: Any, patches: list[str]) -> str:
     """
