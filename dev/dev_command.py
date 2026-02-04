@@ -297,6 +297,8 @@ def run_dev_request(
     # ----------------------------
     # 1) Generate candidate patches
     # ----------------------------
+    print(f"[1/4] Generating patches from {len(decision.author_providers)} author(s)...")
+    
     author_outputs: List[Dict[str, Any]] = []
     author_prompt = build_author_prompt(request=request, context=context)
 
@@ -337,6 +339,8 @@ def run_dev_request(
     # ----------------------------
     # 2) Judge chooses best patch
     # ----------------------------
+    print(f"[2/4] Judge ({decision.judge_provider}) selecting best patch from {len(successful_patches)} candidate(s)...")
+    
     judge_rationale = ""
     chosen_patch = ""
     judge_ok = False
@@ -395,6 +399,8 @@ def run_dev_request(
             chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
             judge_rationale = f"Judge failed: {e}. {fallback_reason}"
 
+    print(f"[3/4] Patch selected. Validation: {'OK' if judge_ok else 'fallback'}.")
+    
     report: Dict[str, Any] = {
         "request": request,
         "context": context,
@@ -425,6 +431,8 @@ def run_dev_request(
         },
     }
 
+    print(f"[4/4] Proposal complete. Ready for review.")
+    
     return report
 
 def run_dev_fix_request(
@@ -492,6 +500,8 @@ def run_dev_fix_request(
 
 
 def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
+    print("[Apply] Starting patch application...")
+    
     patch = (report.get("chosen_patch") or "").strip()
     patch = _strip_markdown_fences(patch)
 
@@ -524,6 +534,8 @@ def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
 
     report["apply"]["attempted"] = True
 
+    print("[Apply] Applying patch to working tree...")
+    
     try:
         changed_files = _extract_changed_files(patch)
         backups = apply_patches(repo_root=repo_root, diff_text=patch)
@@ -533,6 +545,8 @@ def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
         report["apply"]["changed_files"] = changed_files
         report["apply"]["applied"] = True
 
+        print(f"[Apply] Patch applied. Validating {len([p for p in changed_files if p.endswith('.py')])} Python file(s)...")
+        
         python_files = [p for p in changed_files if p.endswith(".py")]
         if python_files:
             compile_ok, compile_out = py_compile_files(repo_root=repo_root, changed_paths=python_files)
@@ -558,6 +572,8 @@ def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
         ).strip()
 
         if not report["apply"]["validation_ok"]:
+            print("[Apply] Validation failed. Rolling back changes...")
+            
             # Rollback: restore files from backups
             rollback_errors = []
             for rel_path, backup_content in backups.items():
@@ -590,6 +606,8 @@ def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
 
             report["apply"]["error"] = error_msg
 
+        print(f"[Apply] Complete. Validation: {'OK' if report['apply']['validation_ok'] else 'FAILED'}.")
+        
         return report
 
     except Exception as e:
