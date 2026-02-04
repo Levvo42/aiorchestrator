@@ -63,14 +63,14 @@ def _safe_json_load(s: str) -> Optional[dict]:
 
 def _validate_unified_diff(diff_text: str) -> Tuple[bool, str]:
     """
-    Structural validation to prevent 'corrupt patch' errors.
+    Structural validation to prevent 'corrupt patch' / 'patch fragment without header' errors.
 
     Rules:
     - Must include at least one 'diff --git a/... b/...'
-    - For each diff --git block:
-        - Must contain '--- a/...' then '+++ b/...'
-        - Must contain at least one hunk header '@@ -.. +.. @@'
-    - No leading prompt garbage
+    - No leading garbage before first diff header
+    - No orphan hunks: '@@ ... @@' must only appear AFTER both '---' and '+++'
+    - No headers after hunks started within a file block
+    - Each diff block must contain '---' and '+++', and at least one hunk
     """
     t = (diff_text or "").strip()
     if not t:
@@ -84,14 +84,21 @@ def _validate_unified_diff(diff_text: str) -> Tuple[bool, str]:
 
     # Reject patches with leading garbage (common LLM failure mode)
     first_diff_idx = next((i for i, l in enumerate(lines) if l.startswith("diff --git ")), None)
-    if first_diff_idx and first_diff_idx > 0:
+    if first_diff_idx is None:
+        return False, "Patch missing 'diff --git' header."
+    if first_diff_idx > 0:
         return False, f"Patch has {first_diff_idx} lines of garbage before first 'diff --git' header."
 
     i = 0
     blocks = 0
+    in_block = False
 
     while i < len(lines):
         line = lines[i]
+
+        # Orphan hunk outside any diff block
+        if _HUNK_RE.match(line) and not in_block:
+            return False, "Orphan hunk '@@' outside any diff block."
 
         if line.startswith("diff --git "):
             m = _DIFF_GIT_RE.match(line)
@@ -99,6 +106,8 @@ def _validate_unified_diff(diff_text: str) -> Tuple[bool, str]:
                 return False, f"Malformed diff header: '{line}'"
 
             blocks += 1
+            in_block = True
+
             saw_minus = False
             saw_plus = False
             saw_hunk = False
@@ -107,24 +116,27 @@ def _validate_unified_diff(diff_text: str) -> Tuple[bool, str]:
             while i < len(lines) and not lines[i].startswith("diff --git "):
                 l = lines[i]
 
-                # allow metadata lines like: new file mode, deleted file mode, similar, rename from/to
+                # Disallow '---' / '+++' AFTER hunks started (this creates corrupt/fragment diffs)
                 if l.startswith("--- "):
-                    # must be exactly '--- a/path' or '--- /dev/null'
+                    if saw_hunk:
+                        return False, "Malformed diff: '---' appears after hunks started."
                     if not (l.startswith("--- a/") or l.startswith("--- /dev/null")):
                         return False, f"Malformed '---' line: '{l}'"
                     saw_minus = True
 
-                if l.startswith("+++ "):
-                    # must be exactly '+++ b/path' or '+++ /dev/null'
+                elif l.startswith("+++ "):
+                    if saw_hunk:
+                        return False, "Malformed diff: '+++' appears after hunks started."
                     if not (l.startswith("+++ b/") or l.startswith("+++ /dev/null")):
                         return False, f"Malformed '+++' line: '{l}'"
                     saw_plus = True
 
-                if _HUNK_RE.match(l):
+                elif _HUNK_RE.match(l):
+                    # Critical rule: hunks only allowed AFTER both file headers
+                    if not (saw_minus and saw_plus):
+                        return False, "Orphan hunk '@@' before file headers '---'/'+++'."
                     saw_hunk = True
 
-                # A very common corruption is stray quotes or prose
-                # We don't reject '+'/'-' content lines, only obvious prose BEFORE headers.
                 i += 1
 
             if not (saw_minus and saw_plus):
@@ -132,6 +144,7 @@ def _validate_unified_diff(diff_text: str) -> Tuple[bool, str]:
             if not saw_hunk:
                 return False, "Missing hunk header '@@ -.. +.. @@' in a diff block."
 
+            # End of this diff block
             continue
 
         i += 1
@@ -140,7 +153,6 @@ def _validate_unified_diff(diff_text: str) -> Tuple[bool, str]:
         return False, "No diff blocks found."
 
     return True, "OK"
-
 
 def _extract_changed_files(diff_text: str) -> List[str]:
     changed: List[str] = []

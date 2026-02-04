@@ -39,6 +39,18 @@ def apply_patches(repo_root: str, diff_text: str) -> Dict[str, str]:
     repo_root = str(Path(repo_root).resolve())
     diff_text = _sanitize_diff(diff_text)
 
+    # 0) Preflight for CORRUPT PATCH ONLY (no working-tree modifications)
+    # We do NOT abort on normal "patch does not apply" here because 3-way may still succeed.
+    chk0 = _run(repo_root, ["--check", "--whitespace=nowarn"], diff_text)
+    if chk0.returncode != 0:
+        msg = (chk0.stderr or chk0.stdout or "").strip()
+        lower = msg.lower()
+        if "corrupt patch" in lower or "patch fragment without header" in lower:
+            raise RuntimeError(
+                "Refusing to apply patch: patch is structurally invalid.\n\n"
+                + msg
+            )
+
     # Identify touched files (best-effort)
     changed_files: List[str] = []
     for line in diff_text.splitlines():
