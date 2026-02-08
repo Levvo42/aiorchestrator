@@ -73,9 +73,9 @@ class Router:
             )
 
         # 3) Default: use one good general provider.
-        # Prefer Gemini for general chat by default in this v0 (you can change this).
+        # Prefer local Ollama for general chat by default (you can change this).
         enabled = self._enabled_providers()
-        preferred = "gemini" if "gemini" in enabled else (enabled[0] if enabled else "")
+        preferred = "ollama_local" if "ollama_local" in enabled else (enabled[0] if enabled else "")
 
         if preferred:
             return RouteDecision(

@@ -31,9 +31,17 @@ from core.router import Router, RouteDecision
 from core.planner import Planner, Plan
 from core.memory import MemoryStore
 from core.judge import Judge
+from core.general_routing import (
+    build_local_assessment_prompt,
+    classify_intent,
+    decide_general_route,
+    parse_local_assessment,
+    summarize_evidence,
+)
 
 # Local tools
 from tools.local_exec import read_file, write_file, list_dir
+from tools.web_search import web_search
 
 # Provider clients (safe to import; actual instantiation happens in __init__)
 from providers.openai_client import OpenAIClient
@@ -157,12 +165,32 @@ class Agent:
 
         route = self.router.decide(task)
         plan = self.planner.make_plan(task, route)
-        execution = self._execute(plan, route)
+        execution: Dict[str, Any]
 
         final_answer: Optional[str] = None
         judge_info: Optional[Dict[str, Any]] = None
+        routing_info: Optional[Dict[str, Any]] = None
 
-        if route.strategy in ("llm_single", "llm_multi", "hybrid"):
+        general_mode = self.memory.get_setting("general_mode", "auto")
+        if route.strategy == "llm_single" and general_mode != "api_only":
+            if route.providers == ["ollama_local"]:
+                execution, final_answer, routing_info = self._run_general_local_first(task)
+            else:
+                execution = self._execute(plan, route)
+        elif route.strategy == "llm_single" and general_mode == "api_only":
+            api_provider = self._best_available_api_provider()
+            if api_provider:
+                route = RouteDecision(
+                    strategy="llm_single",
+                    providers=[api_provider],
+                    reason="General mode api_only: using best available API provider.",
+                )
+                plan = self.planner.make_plan(task, route)
+            execution = self._execute(plan, route)
+        else:
+            execution = self._execute(plan, route)
+
+        if route.strategy in ("llm_single", "llm_multi", "hybrid") and final_answer is None:
             judge_cfg = self.memory.get_judge_config()
             provider_stats = self.memory.get_provider_stats()
 
@@ -197,6 +225,7 @@ class Agent:
             "execution": execution,
             "judge": judge_info,
             "final_answer": final_answer,
+            "routing": routing_info,
             "evaluation": evaluation,
             "elapsed_seconds": round(time.time() - started, 3),
             "available_providers": list(self.provider_map.keys()),
@@ -255,6 +284,171 @@ class Agent:
                 self.memory.update_provider_stats(provider_name, success=False)
 
         return result
+
+    def _best_available_api_provider(self) -> str:
+        runtime = [p for p in self.provider_map.keys() if p != "ollama_local"]
+        if not runtime:
+            return ""
+        if "openai_dev" in runtime:
+            return "openai_dev"
+        if "openai" in runtime:
+            return "openai"
+        if "claude_dev" in runtime:
+            return "claude_dev"
+        if "claude" in runtime:
+            return "claude"
+        return runtime[0]
+
+    def _run_general_local_first(self, task: str) -> tuple[Dict[str, Any], str, Dict[str, Any]]:
+        execution: Dict[str, Any] = {"local": [], "llm": []}
+        routing_info: Dict[str, Any] = {}
+        final_answer = ""
+
+        local_client = self.provider_map.get("ollama_local")
+        if not local_client:
+            api_provider = self._best_available_api_provider()
+            if api_provider:
+                prompt = f"Task:\n{task}\n\nBe direct and practical."
+                text = self.provider_map[api_provider].generate(prompt)
+                execution["llm"].append({"provider": api_provider, "success": True, "text": text})
+                routing_info = {"route": "api", "reason": "local_unavailable", "confidence": 0.0}
+                return execution, text, routing_info
+            return execution, "Local model unavailable and no API providers available.", {
+                "route": "none",
+                "reason": "no_providers",
+                "confidence": 0.0,
+            }
+
+        threshold = float(self.memory.get_setting("general_confidence_threshold", 0.90) or 0.90)
+        web_first_threshold = float(self.memory.get_setting("web_first_threshold", 0.70) or 0.70)
+        general_mode = self.memory.get_setting("general_mode", "auto")
+        intent = classify_intent(task)
+        stats = self.memory.get_general_routing_stats()
+        learned_conf = float(stats.get("per_intent", {}).get(intent, {}).get("confidence", 0.0) or 0.0)
+
+        local_prompt = build_local_assessment_prompt(task, threshold)
+        local_raw = local_client.generate(local_prompt)
+        assessment, error = parse_local_assessment(local_raw)
+
+        invalid_json = assessment is None
+        if assessment is None:
+            assessment = {
+                "answer": local_raw.strip(),
+                "confidence": 0.0,
+                "needs_web": True,
+                "needs_api": False,
+                "uncertainty_reasons": ["invalid_json"],
+                "suggested_search_query": "",
+            }
+
+        if general_mode == "local_only":
+            decision = {"route": "local", "reason": "local_only", "confidence": float(assessment.get("confidence", 0.0) or 0.0)}
+        else:
+            decision = decide_general_route(
+                task=task,
+                assessment=assessment,
+                confidence_threshold=threshold,
+                web_first_threshold=web_first_threshold,
+                learned_confidence=learned_conf,
+            )
+
+        route = decision["route"]
+        confidence = decision["confidence"]
+        reason = decision["reason"]
+        query = assessment.get("suggested_search_query") or task
+        used_web = False
+        used_api = False
+        local_only_answer = False
+
+        if route == "local":
+            final_answer = assessment.get("answer", "")
+            if general_mode == "local_only":
+                uncertainty = assessment.get("uncertainty_reasons") or []
+                if uncertainty or confidence < threshold:
+                    final_answer = (
+                        f"{final_answer}\n\n"
+                        "Note: Uncertain response from local model."
+                    )
+            local_only_answer = True
+            routing_info = {"route": "local", "confidence": confidence, "reason": reason}
+            print(f"Route: local (conf={confidence:.2f})")
+        elif route in ("web", "web_api"):
+            used_web = True
+            results = web_search(query, max_results=3)
+            evidence = summarize_evidence(results)
+            web_weak = len(results) < 1
+            if route == "web_api" or assessment.get("needs_api") or web_weak:
+                api_provider = self._best_available_api_provider()
+                if api_provider:
+                    used_api = True
+                    api_prompt = (
+                        "You are a reliable assistant. Use the web evidence below to answer the task.\n"
+                        "If evidence is weak or conflicting, state uncertainty.\n\n"
+                        f"Task:\n{task}\n\n"
+                        f"Web evidence:\n{evidence}\n"
+                    )
+                    text = self.provider_map[api_provider].generate(api_prompt)
+                    execution["llm"].append({"provider": api_provider, "success": True, "text": text})
+                    final_answer = text
+                    print(f"Route: local->web->api (conf={confidence:.2f})")
+                else:
+                    synth_prompt = (
+                        "Use the web evidence to answer the task. If insufficient, say so.\n\n"
+                        f"Task:\n{task}\n\n"
+                        f"Web evidence:\n{evidence}\n"
+                    )
+                    final_answer = local_client.generate(synth_prompt)
+                    print(f"Route: local->web (conf={confidence:.2f}, query=\"{query}\")")
+            else:
+                synth_prompt = (
+                    "Use the web evidence to answer the task. If insufficient, say so.\n\n"
+                    f"Task:\n{task}\n\n"
+                    f"Web evidence:\n{evidence}\n"
+                )
+                final_answer = local_client.generate(synth_prompt)
+                print(f"Route: local->web (conf={confidence:.2f}, query=\"{query}\")")
+
+            routing_info = {
+                "route": "local->web->api" if used_api else "local->web",
+                "confidence": confidence,
+                "reason": reason,
+                "query": query,
+            }
+        elif route == "api":
+            api_provider = self._best_available_api_provider()
+            if api_provider:
+                used_api = True
+                api_prompt = f"Task:\n{task}\n\nBe direct and practical."
+                text = self.provider_map[api_provider].generate(api_prompt)
+                execution["llm"].append({"provider": api_provider, "success": True, "text": text})
+                final_answer = text
+                print(f"Route: local->api (conf={confidence:.2f})")
+                routing_info = {"route": "local->api", "confidence": confidence, "reason": reason}
+            else:
+                final_answer = assessment.get("answer", "")
+                routing_info = {"route": "local", "confidence": confidence, "reason": "api_unavailable"}
+        else:
+            final_answer = assessment.get("answer", "")
+            routing_info = {"route": "local", "confidence": confidence, "reason": reason}
+
+        if invalid_json and general_mode == "local_only":
+            final_answer = (
+                f"{assessment.get('answer', '')}\n\n"
+                "Note: Local model did not provide structured confidence; treat this as uncertain."
+            )
+
+        self.memory.update_general_routing_stats(
+            info={
+                "intent": intent,
+                "local_json_valid": not invalid_json,
+                "local_only_answer": local_only_answer,
+                "web_escalated": used_web,
+                "api_escalated": used_api,
+                "invalid_json": invalid_json,
+            }
+        )
+
+        return execution, final_answer, routing_info
 
     def _run_local_tool(self, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
         try:

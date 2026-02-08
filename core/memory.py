@@ -38,6 +38,19 @@ def _default_local_judge_bucket() -> Dict[str, Any]:
     }
 
 
+def _default_general_routing_bucket() -> Dict[str, Any]:
+    return {
+        "total_general_prompts": 0,
+        "local_only_answers": 0,
+        "web_escalations": 0,
+        "api_escalations": 0,
+        "local_json_total": 0,
+        "local_json_valid": 0,
+        "local_json_valid_rate": 0.0,
+        "confidence": 0.0,
+    }
+
+
 DEFAULT_STATE: Dict[str, Any] = {
     "runs": [],
     "provider_stats": {},
@@ -46,11 +59,18 @@ DEFAULT_STATE: Dict[str, Any] = {
         "per_intent": {},
         "per_provider": {},
     },
+    "general_routing_stats": {
+        "overall": _default_general_routing_bucket(),
+        "per_intent": {},
+    },
     "notes": [],
     "settings": {
         "judge_mode": "auto",
         "judge_provider": None,
         "judge_threshold": 0.90,
+        "general_mode": "auto",
+        "general_confidence_threshold": 0.90,
+        "web_first_threshold": 0.70,
         "dev_mode": "auto",
         "dev_authors": None,
         "dev_judge_provider": None,
@@ -122,6 +142,7 @@ class MemoryStore:
         self.state.setdefault("runs", [])
         self.state.setdefault("provider_stats", {})
         self.state.setdefault("local_judge_stats", {})
+        self.state.setdefault("general_routing_stats", {})
         self.state.setdefault("notes", [])
         self.state.setdefault("settings", {})
 
@@ -134,6 +155,9 @@ class MemoryStore:
         settings.setdefault("judge_mode", "auto")
         settings.setdefault("judge_provider", None)
         settings.setdefault("judge_threshold", 0.90)
+        settings.setdefault("general_mode", "auto")
+        settings.setdefault("general_confidence_threshold", 0.90)
+        settings.setdefault("web_first_threshold", 0.70)
 
         # Dev settings
         settings.setdefault("dev_mode", "auto")
@@ -155,6 +179,14 @@ class MemoryStore:
         local_stats.setdefault("overall", _default_local_judge_bucket())
         local_stats.setdefault("per_intent", {})
         local_stats.setdefault("per_provider", {})
+
+        general_stats = self.state.get("general_routing_stats")
+        if not isinstance(general_stats, dict):
+            general_stats = {}
+            self.state["general_routing_stats"] = general_stats
+
+        general_stats.setdefault("overall", _default_general_routing_bucket())
+        general_stats.setdefault("per_intent", {})
 
     # -----------------------
     # Run logging
@@ -299,6 +331,73 @@ class MemoryStore:
         if selected_source == "local" and not apply_ok:
             for b in _local_buckets():
                 b["confidence"] = max(0.0, float(b.get("confidence", 0.0) or 0.0) - 0.30)
+
+        self._save()
+
+    # -----------------------
+    # General routing stats
+    # -----------------------
+
+    def get_general_routing_stats(self) -> Dict[str, Any]:
+        """Return general routing stats dictionary."""
+        return self.state.get("general_routing_stats", {})
+
+    def update_general_routing_stats(self, info: Dict[str, Any]) -> None:
+        """
+        Update general routing stats for local-first routing decisions.
+
+        Expected info shape (keys are optional):
+          - intent
+          - local_json_valid
+          - local_only_answer
+          - web_escalated
+          - api_escalated
+        """
+        if not isinstance(info, dict):
+            return
+
+        stats = self.state.setdefault("general_routing_stats", {})
+        overall = stats.setdefault("overall", _default_general_routing_bucket())
+        per_intent = stats.setdefault("per_intent", {})
+
+        intent = str(info.get("intent") or "general")
+        intent_bucket = per_intent.setdefault(intent, _default_general_routing_bucket())
+
+        local_json_valid = bool(info.get("local_json_valid"))
+        local_only_answer = bool(info.get("local_only_answer"))
+        web_escalated = bool(info.get("web_escalated"))
+        api_escalated = bool(info.get("api_escalated"))
+        invalid_json = bool(info.get("invalid_json"))
+
+        for b in (overall, intent_bucket):
+            b["total_general_prompts"] += 1
+            b["local_json_total"] += 1
+            if local_json_valid:
+                b["local_json_valid"] += 1
+            if local_only_answer:
+                b["local_only_answers"] += 1
+            if web_escalated:
+                b["web_escalations"] += 1
+            if api_escalated:
+                b["api_escalations"] += 1
+
+        def _update_rates(bucket: Dict[str, Any]) -> None:
+            total = bucket.get("local_json_total", 0) or 0
+            valid = bucket.get("local_json_valid", 0) or 0
+            bucket["local_json_valid_rate"] = (valid / total) if total else 0.0
+
+        for b in (overall, intent_bucket):
+            _update_rates(b)
+
+        for b in (overall, intent_bucket):
+            conf = float(b.get("confidence", 0.0) or 0.0)
+            if local_only_answer and local_json_valid and not (web_escalated or api_escalated):
+                conf = min(1.0, conf + 0.05)
+            if invalid_json:
+                conf = max(0.0, conf - 0.20)
+            elif web_escalated or api_escalated:
+                conf = max(0.0, conf - 0.05)
+            b["confidence"] = conf
 
         self._save()
 
