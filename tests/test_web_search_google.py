@@ -40,6 +40,7 @@ class WebSearchGoogleTests(unittest.TestCase):
         self.assertEqual(results[0]["url"], "https://a.example")
 
         request = mocked.call_args[0][0]
+        self.assertIn("cx=cx", request.full_url)
         self.assertIn("q=digital+clock+invented", request.full_url)
         self.assertIn("num=2", request.full_url)
 

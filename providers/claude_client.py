@@ -15,6 +15,8 @@ import os
 from langchain_anthropic import ChatAnthropic  # pip install langchain-anthropic
 from langchain_core.messages import HumanMessage
 
+from core.env import require_env_var
+
 
 class ClaudeClient:
     """
@@ -26,9 +28,7 @@ class ClaudeClient:
     """
 
     def __init__(self, model: str | None = None, temperature: float = 0.2) -> None:
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY is missing. Add it to your .env file.")
+        api_key = require_env_var("ANTHROPIC_API_KEY")
 
         self.model = model or os.getenv("ANTHROPIC_DEV_MODEL", "claude-sonnet-4-5")
 

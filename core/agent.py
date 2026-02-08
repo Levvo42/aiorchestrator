@@ -43,7 +43,6 @@ from core.general_routing import (
 
 # Local tools
 from tools.local_exec import read_file, write_file, list_dir
-from tools.web_search import web_search
 from tools.web_search_google import web_search_google_status
 
 # Provider clients (safe to import; actual instantiation happens in __init__)
@@ -413,22 +412,7 @@ class Agent:
                 print(f"WebSearch: google_cse FAILED reason=\"{reason_detail}\"")
 
             if status != "ok":
-                results = web_search(query, max_results=3)
-                search_tool = "duckduckgo"
-                providers_used[-1] = f"web_search_{search_tool}"
-                execution["local"].append(
-                    {
-                        "tool": f"web_search_{search_tool}",
-                        "args": {"query": query},
-                        "success": bool(results),
-                        "output": results,
-                        "error": "" if results else "empty",
-                    }
-                )
-                if results:
-                    print(f"WebSearch: duckduckgo query=\"{query}\" results={len(results)}")
-                else:
-                    print("WebSearch: duckduckgo EMPTY")
+                search_tool = "google_cse"
             evidence = summarize_evidence(results)
             web_weak = len(results) < 1
             if web_weak:

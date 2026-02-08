@@ -160,8 +160,7 @@ class GeneralRoutingTests(unittest.TestCase):
             agent.provider_map = {"ollama_local": local, "openai_dev": api}
 
             with patch("core.agent.web_search_google_status", return_value=([{"title": "t", "snippet": "s", "url": "u"}], "ok", "")):
-                with patch("core.agent.web_search", return_value=[]):
-                    run = agent.run("When was the digital clock invented?")
+                run = agent.run("When was the digital clock invented?")
 
             self.assertEqual(len(local.calls), 2)
             self.assertEqual(len(api.calls), 0)
@@ -205,8 +204,7 @@ class GeneralRoutingTests(unittest.TestCase):
             agent.provider_map = {"ollama_local": local, "openai_dev": api}
 
             with patch("core.agent.web_search_google_status", return_value=([{"title": "t", "snippet": "s", "url": "u"}], "ok", "")):
-                with patch("core.agent.web_search", return_value=[]):
-                    run = agent.run("When was the digital clock invented?")
+                run = agent.run("When was the digital clock invented?")
 
             self.assertEqual(run["routing"]["route"], "local->web")
             self.assertEqual(run["routing"]["search_tool"], "google_cse")
@@ -250,8 +248,7 @@ class GeneralRoutingTests(unittest.TestCase):
             agent.provider_map = {"ollama_local": local, "openai_dev": api}
 
             with patch("core.agent.web_search_google_status", return_value=([{"title": "t", "snippet": "s", "url": "u"}], "ok", "")):
-                with patch("core.agent.web_search", return_value=[]):
-                    run = agent.run("How's the weather in Duved, Sweden?")
+                run = agent.run("How's the weather in Duved, Sweden?")
 
             self.assertEqual(run["routing"]["route"], "local->web")
             self.assertEqual(len(api.calls), 0)
@@ -293,8 +290,7 @@ class GeneralRoutingTests(unittest.TestCase):
             agent.provider_map = {"ollama_local": local, "openai_dev": api}
 
             with patch("core.agent.web_search_google_status", return_value=([], "error", "boom")):
-                with patch("core.agent.web_search", return_value=[]):
-                    run = agent.run("How's the weather in Duved, Sweden?")
+                run = agent.run("How's the weather in Duved, Sweden?")
 
             self.assertEqual(run["routing"]["route"], "local->web->api")
             self.assertGreater(len(api.calls), 0)

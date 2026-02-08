@@ -15,6 +15,7 @@ from typing import Optional
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
+from core.env import require_env_var
 
 class OpenAIClient:
     """
@@ -40,8 +41,7 @@ class OpenAIClient:
         Raises:
             RuntimeError if OPENAI_API_KEY is missing.
         """
-        if not os.getenv("OPENAI_API_KEY"):
-            raise RuntimeError("OPENAI_API_KEY is missing. Put it in your .env file.")
+        require_env_var("OPENAI_API_KEY")
 
         llm = ChatOpenAI(
             model=self.model,

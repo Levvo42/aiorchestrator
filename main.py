@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Optional
 from core.agent import Agent
 from core.memory import MemoryStore
+from core.env import validate_required_env_vars
 from dev.dev_command import run_dev_request, run_dev_fix_request, apply_dev_patch
 
 
@@ -27,6 +28,16 @@ def load_capabilities(path: str = "core/capabilities.json") -> dict:
     """Load capabilities registry from disk."""
     p = Path(path)
     return json.loads(p.read_text(encoding="utf-8"))
+
+
+def _validate_env_for_enabled_providers(capabilities: dict) -> None:
+    providers = capabilities.get("providers", {})
+    required = []
+    for _name, cfg in providers.items():
+        if cfg.get("enabled", False) and cfg.get("env_key_required"):
+            required.append(cfg["env_key_required"])
+    if required:
+        validate_required_env_vars(required)
 
 
 def normalize_provider_name(name: str) -> str:
@@ -385,6 +396,7 @@ if __name__ == "__main__":
     load_dotenv()
 
     capabilities = load_capabilities()
+    _validate_env_for_enabled_providers(capabilities)
     memory = MemoryStore("memory/state.json")
     agent = Agent(capabilities=capabilities, memory=memory)
     # Holds a dev report that has been proposed but not yet confirmed/applied.
