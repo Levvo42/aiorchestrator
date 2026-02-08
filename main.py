@@ -1,3 +1,4 @@
+# python
 """
 main.py
 -------
@@ -36,10 +37,22 @@ def normalize_provider_name(name: str) -> str:
     return name.strip().lower()
 
 
-def handle_command(text: str, memory: MemoryStore) -> Optional[str]:
+def _show_dev_progress(step: str, info: Optional[str] = None) -> None:
+    """Lightweight progress printer for dev self-patch flow."""
+    if info:
+        print(f"[progress] {step}: {info}")
+    else:
+        print(f"[progress] {step}")
+
+
+def handle_command(text: str, memory: MemoryStore,
+                   pending_dev_report: Optional[dict] = None,
+                   last_applied_dev_report: Optional[dict] = None) -> Optional[str]:
     """
     Handle console commands that change judge settings.
     Returns a user-friendly message if a command was handled, otherwise None.
+
+    Note: accepts pending and last-applied dev report to support 'Dev: Commit with message' command.
     """
     t = text.strip()
     if t.lower() == "show dev settings":
@@ -77,27 +90,27 @@ def handle_command(text: str, memory: MemoryStore) -> Optional[str]:
         parts = text.split("\"")
         if len(parts) < 2:
             return "Usage: Dev: Commit with message \"<your commit message>\""
-        
+
         commit_msg = parts[1].strip()
         if not commit_msg:
             return "Commit message cannot be empty."
-        
-        # Check if there's a pending dev report with successful validation
-        if pending_dev_report is None:
+
+        # Use last_applied_dev_report (the applied patch) for committing
+        if last_applied_dev_report is None:
             return "No dev patch has been applied. Use 'Dev: <request>' first, then apply the patch."
-        
-        if not pending_dev_report.get("apply", {}).get("applied"):
+
+        if not last_applied_dev_report.get("apply", {}).get("applied"):
             return "Last dev patch was not applied successfully."
-        
-        if not pending_dev_report.get("apply", {}).get("validation_ok"):
+
+        if not last_applied_dev_report.get("apply", {}).get("validation_ok"):
             return "Cannot commit: last dev patch did not pass validation."
-        
+
         # Check if working tree is clean (only staged changes allowed)
         try:
             result = subprocess.run(["git", "diff", "--quiet"], cwd=".", check=False)
             if result.returncode != 0:
                 return "Cannot commit: working tree has unstaged changes. Stage your changes first with 'git add'."
-            
+
             subprocess.run(["git", "commit", "-m", commit_msg], cwd=".", check=True, capture_output=True, text=True)
             return f"Committed successfully with message: \"{commit_msg}\""
         except subprocess.CalledProcessError as e:
@@ -181,7 +194,6 @@ def handle_command(text: str, memory: MemoryStore) -> Optional[str]:
 
         memory.set_verbosity(level)
         return f"Verbosity set to: {level}"
-
 
     return None
 
@@ -357,7 +369,10 @@ if __name__ == "__main__":
                 # Store the report before applying so we can reference it for commits
                 last_applied_dev_report = pending_dev_report
 
+                _show_dev_progress("apply", "Starting apply of proposed patch")
                 pending_dev_report = apply_dev_patch(repo_root=".", report=pending_dev_report)
+
+                _show_dev_progress("apply", "Apply completed")
 
                 print("\n=== APPLY RESULT ===")
                 print(f"Applied: {pending_dev_report['apply']['applied']}")
@@ -371,6 +386,7 @@ if __name__ == "__main__":
                 # ✅ If apply failed, offer auto-fix + re-propose BEFORE doing anything else.
                 if not pending_dev_report["apply"].get("applied"):
                     if _prompt_yes_no("Attempt auto-fix and re-propose a patch? (yes/no) "):
+                        _show_dev_progress("fix", "Requesting auto-fix proposal")
                         fix_report = run_dev_fix_request(
                             repo_root=".",
                             failed_report=pending_dev_report,
@@ -378,6 +394,7 @@ if __name__ == "__main__":
                             memory=memory,
                             provider_map=agent.provider_map,
                         )
+                        _show_dev_progress("fix", "Auto-fix proposal received")
 
                         print("\n=== PROPOSED FIX PATCH ===")
                         print(fix_report.get("chosen_patch") or "(no patch produced)")
@@ -466,7 +483,7 @@ if __name__ == "__main__":
         # -------------------
         # B) NORMAL COMMANDS
         # -------------------
-        msg = handle_command(text, memory)
+        msg = handle_command(text, memory, pending_dev_report, last_applied_dev_report)
         if msg:
             print(msg)
             continue
@@ -480,6 +497,7 @@ if __name__ == "__main__":
                 print("Usage: Dev: <describe the change you want>")
                 continue
 
+            _show_dev_progress("request", "Requesting patch proposal")
             report = run_dev_request(
                 repo_root=".",
                 request=dev_request,
@@ -487,6 +505,7 @@ if __name__ == "__main__":
                 memory=memory,
                 provider_map=agent.provider_map
             )
+            _show_dev_progress("request", "Patch proposal received")
 
             print("\n=== DEV POLICY ===")
             print(f"Mode: {report['policy']['mode']}")
