@@ -201,3 +201,69 @@ def build_judge_prompt(request: str, context: Any, patches: list[str]) -> str:
     )
 
     return "\n".join(lines)
+
+
+def build_local_judge_prompt(request: str, context: Any, patches: list[str]) -> str:
+    """
+    Prompt for local Ollama judge.
+
+    Output (STRICT JSON):
+      {
+        "patch_index": <int or null>,
+        "confidence": <number 0..1>,
+        "uncertainty_reasons": ["..."],
+        "rationale": "short"
+      }
+    """
+    context_text = _context_to_text(context)
+
+    lines: list[str] = []
+
+    lines.append(
+        "You are a local PATCH JUDGE running via Ollama.\n"
+        "You must decide whether you are confident enough to pick a patch.\n"
+        "If you are uncertain, set patch_index to null OR confidence below 0.90,\n"
+        "and list uncertainty_reasons.\n"
+        "Never guess when uncertain.\n"
+    )
+
+    lines.append("=== USER REQUEST ===")
+    lines.append(request.strip())
+    lines.append("")
+
+    if context_text:
+        lines.append("=== CONTEXT (JSON BUNDLE) ===")
+        lines.append(context_text)
+        lines.append("")
+
+    lines.append("=== CANDIDATE PATCHES ===")
+    for i, patch_text in enumerate(patches):
+        lines.append(f"\n[PATCH {i}]")
+        lines.append(patch_text.strip())
+
+    lines.append(
+        "\n=== EVALUATION CRITERIA ===\n"
+        "- Correctness: does it implement the request?\n"
+        "- Minimality: smallest necessary change, avoids unrelated edits.\n"
+        "- Safety: avoids breaking behavior; avoids risky refactors.\n"
+        "- Patch quality: looks like a real unified diff; applies cleanly.\n"
+    )
+
+    lines.append(
+        "=== OUTPUT RULES (STRICT) ===\n"
+        "Return ONLY valid JSON.\n"
+        "No markdown.\n"
+        "No extra text before or after JSON.\n"
+        "If uncertain, you MUST set patch_index to null OR confidence below 0.90,\n"
+        "and include uncertainty_reasons.\n"
+        "\n"
+        "Output format:\n"
+        "{\n"
+        '  "patch_index": <integer or null>,\n'
+        '  "confidence": <number between 0 and 1>,\n'
+        '  "uncertainty_reasons": ["..."],\n'
+        '  "rationale": "<short explanation>"\n'
+        "}\n"
+    )
+
+    return "\n".join(lines)
