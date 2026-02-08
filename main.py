@@ -134,6 +134,9 @@ def handle_command(text: str, memory: MemoryStore,
             "  Set Judge: <provider>\n"
             "  Set Judge Mode: auto | fixed | local_only | api_only\n"
             "  Set Judge Threshold: <0..1>\n"
+            "  Set General Mode: auto | local_only | api_only\n"
+            "  Set General Confidence Threshold: <0..1>\n"
+            "  Set Web First Threshold: <0..1>\n"
             "  Set Verbosity: full | normal | final\n"
             "\nDev workflow:\n"
             "  Dev: <request>\n"
@@ -206,6 +209,35 @@ def handle_command(text: str, memory: MemoryStore,
         for k, v in cfg.items():
             lines.append(f"- {k}: {v}")
         return "\n".join(lines)
+
+    if t.lower().startswith("set general mode:"):
+        mode = t.split(":", 1)[1].strip().lower()
+        if mode not in ("auto", "local_only", "api_only"):
+            return "Invalid general mode. Use: Set General Mode: auto | local_only | api_only"
+        memory.set_setting("general_mode", mode)
+        return f"General mode set to: {mode}"
+
+    if t.lower().startswith("set general confidence threshold:"):
+        raw = t.split(":", 1)[1].strip()
+        try:
+            value = float(raw)
+        except ValueError:
+            return "Invalid general confidence threshold. Use a number between 0 and 1."
+        if value < 0.0 or value > 1.0:
+            return "Invalid general confidence threshold. Use a number between 0 and 1."
+        memory.set_setting("general_confidence_threshold", value)
+        return f"General confidence threshold set to: {value}"
+
+    if t.lower().startswith("set web first threshold:"):
+        raw = t.split(":", 1)[1].strip()
+        try:
+            value = float(raw)
+        except ValueError:
+            return "Invalid web first threshold. Use a number between 0 and 1."
+        if value < 0.0 or value > 1.0:
+            return "Invalid web first threshold. Use a number between 0 and 1."
+        memory.set_setting("web_first_threshold", value)
+        return f"Web first threshold set to: {value}"
 
     # Set Verbosity
     if t.lower().startswith("set verbosity:"):
