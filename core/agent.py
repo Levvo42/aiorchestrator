@@ -33,8 +33,10 @@ from core.memory import MemoryStore
 from core.judge import Judge
 from core.general_routing import (
     build_local_assessment_prompt,
+    build_local_evidence_prompt,
     classify_intent,
     decide_general_route,
+    is_factual_query,
     parse_local_assessment,
     summarize_evidence,
 )
@@ -42,6 +44,7 @@ from core.general_routing import (
 # Local tools
 from tools.local_exec import read_file, write_file, list_dir
 from tools.web_search import web_search
+from tools.web_search_google import web_search_google
 
 # Provider clients (safe to import; actual instantiation happens in __init__)
 from providers.openai_client import OpenAIClient
@@ -332,11 +335,12 @@ class Agent:
 
         invalid_json = assessment is None
         if assessment is None:
+            factual = is_factual_query(task)
             assessment = {
-                "answer": local_raw.strip(),
+                "final_answer": local_raw.strip(),
                 "confidence": 0.0,
-                "needs_web": True,
-                "needs_api": False,
+                "escalate_to": "web" if factual else "api",
+                "search_query": "",
                 "uncertainty_reasons": ["invalid_json"],
                 "suggested_search_query": "",
             }
@@ -355,13 +359,13 @@ class Agent:
         route = decision["route"]
         confidence = decision["confidence"]
         reason = decision["reason"]
-        query = assessment.get("suggested_search_query") or task
+        query = assessment.get("search_query") or assessment.get("suggested_search_query") or task
         used_web = False
         used_api = False
         local_only_answer = False
 
         if route == "local":
-            final_answer = assessment.get("answer", "")
+            final_answer = assessment.get("final_answer", "")
             if general_mode == "local_only":
                 uncertainty = assessment.get("uncertainty_reasons") or []
                 if uncertainty or confidence < threshold:
@@ -370,14 +374,19 @@ class Agent:
                         "Note: Uncertain response from local model."
                     )
             local_only_answer = True
+            execution["llm"].append({"provider": "ollama_local", "success": True, "text": final_answer})
             routing_info = {"route": "local", "confidence": confidence, "reason": reason}
             print(f"Route: local (conf={confidence:.2f})")
-        elif route in ("web", "web_api"):
+        elif route == "web":
             used_web = True
-            results = web_search(query, max_results=3)
+            results = web_search_google(query, num_results=3)
+            search_tool = "google_cse"
+            if not results:
+                results = web_search(query, max_results=3)
+                search_tool = "fallback"
             evidence = summarize_evidence(results)
             web_weak = len(results) < 1
-            if route == "web_api" or assessment.get("needs_api") or web_weak:
+            if web_weak:
                 api_provider = self._best_available_api_provider()
                 if api_provider:
                     used_api = True
@@ -392,27 +401,20 @@ class Agent:
                     final_answer = text
                     print(f"Route: local->web->api (conf={confidence:.2f})")
                 else:
-                    synth_prompt = (
-                        "Use the web evidence to answer the task. If insufficient, say so.\n\n"
-                        f"Task:\n{task}\n\n"
-                        f"Web evidence:\n{evidence}\n"
-                    )
-                    final_answer = local_client.generate(synth_prompt)
-                    print(f"Route: local->web (conf={confidence:.2f}, query=\"{query}\")")
+                    final_answer = assessment.get("final_answer", "")
+                    print(f"Route: local->web ({search_tool})")
             else:
-                synth_prompt = (
-                    "Use the web evidence to answer the task. If insufficient, say so.\n\n"
-                    f"Task:\n{task}\n\n"
-                    f"Web evidence:\n{evidence}\n"
-                )
+                synth_prompt = build_local_evidence_prompt(task, evidence)
                 final_answer = local_client.generate(synth_prompt)
-                print(f"Route: local->web (conf={confidence:.2f}, query=\"{query}\")")
+                execution["llm"].append({"provider": "ollama_local", "success": True, "text": final_answer})
+                print(f"Route: local->web ({search_tool})")
 
             routing_info = {
                 "route": "local->web->api" if used_api else "local->web",
                 "confidence": confidence,
                 "reason": reason,
                 "query": query,
+                "search_tool": search_tool,
             }
         elif route == "api":
             api_provider = self._best_available_api_provider()
@@ -425,15 +427,15 @@ class Agent:
                 print(f"Route: local->api (conf={confidence:.2f})")
                 routing_info = {"route": "local->api", "confidence": confidence, "reason": reason}
             else:
-                final_answer = assessment.get("answer", "")
+                final_answer = assessment.get("final_answer", "")
                 routing_info = {"route": "local", "confidence": confidence, "reason": "api_unavailable"}
         else:
-            final_answer = assessment.get("answer", "")
+            final_answer = assessment.get("final_answer", "")
             routing_info = {"route": "local", "confidence": confidence, "reason": reason}
 
         if invalid_json and general_mode == "local_only":
             final_answer = (
-                f"{assessment.get('answer', '')}\n\n"
+                f"{assessment.get('final_answer', '')}\n\n"
                 "Note: Local model did not provide structured confidence; treat this as uncertain."
             )
 

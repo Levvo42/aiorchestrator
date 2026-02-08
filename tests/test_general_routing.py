@@ -1,7 +1,9 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from core.agent import Agent
 from core.general_routing import decide_general_route, parse_local_assessment
 from core.memory import MemoryStore
 
@@ -23,10 +25,10 @@ class GeneralRoutingTests(unittest.TestCase):
 
     def test_factual_below_threshold_triggers_web(self) -> None:
         assessment = {
-            "answer": "Not sure",
+            "final_answer": "Not sure",
             "confidence": 0.5,
-            "needs_web": False,
-            "needs_api": False,
+            "escalate_to": "none",
+            "search_query": "latest python version",
             "uncertainty_reasons": [],
             "suggested_search_query": "latest python version",
         }
@@ -41,10 +43,10 @@ class GeneralRoutingTests(unittest.TestCase):
 
     def test_non_factual_below_threshold_triggers_api(self) -> None:
         assessment = {
-            "answer": "Draft response",
+            "final_answer": "Draft response",
             "confidence": 0.5,
-            "needs_web": False,
-            "needs_api": False,
+            "escalate_to": "none",
+            "search_query": "",
             "uncertainty_reasons": [],
             "suggested_search_query": "",
         }
@@ -79,6 +81,136 @@ class GeneralRoutingTests(unittest.TestCase):
             overall = stats.get("overall", {})
             self.assertEqual(overall.get("total_general_prompts"), 1)
             self.assertEqual(overall.get("web_escalations"), 1)
+
+    def test_hello_uses_ollama_only(self) -> None:
+        class StubProvider:
+            def __init__(self, response: str) -> None:
+                self.response = response
+                self.calls = []
+
+            def generate(self, prompt: str) -> str:
+                self.calls.append(prompt)
+                return self.response
+
+        capabilities = {
+            "providers": {
+                "ollama_local": {"enabled": True},
+                "openai_dev": {"enabled": True},
+            },
+            "routing_rules": {},
+            "judge": {"task_intent_keywords": {}},
+            "dev": {},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = MemoryStore(
+                state_path=str(Path(tmp) / "state.local.json"),
+                seed_path=str(Path(tmp) / "state.json"),
+            )
+            memory.set_setting("general_mode", "auto")
+
+            agent = Agent(capabilities=capabilities, memory=memory)
+
+            local_json = (
+                '{"final_answer": "Hello!", "confidence": 1.0, "escalate_to": "none", '
+                '"search_query": "", "uncertainty_reasons": [], "suggested_search_query": ""}'
+            )
+            local = StubProvider(local_json)
+            api = StubProvider("API answer")
+
+            agent.provider_map = {"ollama_local": local, "openai_dev": api}
+
+            run = agent.run("Hello!")
+
+            self.assertEqual(len(local.calls), 1)
+            self.assertEqual(len(api.calls), 0)
+            self.assertEqual(run["routing"]["route"], "local")
+            self.assertEqual(run["execution"]["llm"][0]["provider"], "ollama_local")
+
+    def test_invalid_json_escalates(self) -> None:
+        class StubProvider:
+            def __init__(self, response: str) -> None:
+                self.response = response
+                self.calls = []
+
+            def generate(self, prompt: str) -> str:
+                self.calls.append(prompt)
+                return self.response
+
+        capabilities = {
+            "providers": {
+                "ollama_local": {"enabled": True},
+                "openai_dev": {"enabled": True},
+            },
+            "routing_rules": {},
+            "judge": {"task_intent_keywords": {}},
+            "dev": {},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = MemoryStore(
+                state_path=str(Path(tmp) / "state.local.json"),
+                seed_path=str(Path(tmp) / "state.json"),
+            )
+            memory.set_setting("general_mode", "auto")
+
+            agent = Agent(capabilities=capabilities, memory=memory)
+            local = StubProvider("not json")
+            api = StubProvider("API answer")
+            agent.provider_map = {"ollama_local": local, "openai_dev": api}
+
+            with patch("core.agent.web_search_google", return_value=[{"title": "t", "snippet": "s", "url": "u"}]):
+                with patch("core.agent.web_search", return_value=[]):
+                    run = agent.run("When was the digital clock invented?")
+
+            self.assertEqual(len(local.calls), 2)
+            self.assertEqual(len(api.calls), 0)
+            self.assertEqual(run["routing"]["route"], "local->web")
+
+    def test_digital_clock_invention_uses_web(self) -> None:
+        class StubProvider:
+            def __init__(self, responses: list[str]) -> None:
+                self.responses = responses
+                self.calls = []
+
+            def generate(self, prompt: str) -> str:
+                self.calls.append(prompt)
+                return self.responses.pop(0)
+
+        capabilities = {
+            "providers": {
+                "ollama_local": {"enabled": True},
+                "openai_dev": {"enabled": True},
+            },
+            "routing_rules": {},
+            "judge": {"task_intent_keywords": {}},
+            "dev": {},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = MemoryStore(
+                state_path=str(Path(tmp) / "state.local.json"),
+                seed_path=str(Path(tmp) / "state.json"),
+            )
+            memory.set_setting("general_mode", "auto")
+
+            agent = Agent(capabilities=capabilities, memory=memory)
+            local = StubProvider([
+                '{"final_answer": "Not sure", "confidence": 0.2, "escalate_to": "none", '
+                '"search_query": "digital clock invented", "uncertainty_reasons": [], '
+                '"suggested_search_query": ""}',
+                "The digital clock was invented in the 1950s. Source: http://example.com",
+            ])
+            api = StubProvider(["API answer"])
+            agent.provider_map = {"ollama_local": local, "openai_dev": api}
+
+            with patch("core.agent.web_search_google", return_value=[{"title": "t", "snippet": "s", "url": "u"}]):
+                with patch("core.agent.web_search", return_value=[]):
+                    run = agent.run("When was the digital clock invented?")
+
+            self.assertEqual(run["routing"]["route"], "local->web")
+            self.assertEqual(run["routing"]["search_tool"], "google_cse")
+            self.assertEqual(len(api.calls), 0)
 
 
 if __name__ == "__main__":

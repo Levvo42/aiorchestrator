@@ -61,21 +61,23 @@ def build_local_assessment_prompt(task: str, threshold: float) -> str:
     return (
         "System: You are a local model. You must respond ONLY with valid JSON.\n"
         "System: Provide a direct answer plus a strict self-assessment.\n"
-        "System: If uncertain, set confidence < {thresh:.2f} and explain why.\n"
-        "System: If the question is factual/time-sensitive and confidence < {thresh:.2f},\n"
-        "System: set needs_web=true and provide suggested_search_query.\n"
+        "System: Return ONLY JSON. No other text.\n"
+        "System: For greetings/smalltalk, set confidence to 1.0 and escalate_to=\"none\".\n"
+        f"System: If uncertain, set confidence < {threshold:.2f} and explain why.\n"
+        f"System: If the question is factual/time-sensitive and confidence < {threshold:.2f},\n"
+        "System: set escalate_to=\"web\" and provide search_query.\n"
         "System: Do not include any text outside JSON.\n\n"
         "JSON schema:\n"
         "{\n"
-        '  "answer": "string",\n'
+        '  "final_answer": "string",\n'
         '  "confidence": 0.0,\n'
-        '  "needs_web": false,\n'
-        '  "needs_api": false,\n'
+        '  "escalate_to": "none",\n'
+        '  "search_query": "string or empty",\n'
         '  "uncertainty_reasons": ["..."],\n'
         '  "suggested_search_query": "string or empty"\n'
         "}\n\n"
         f"Task:\n{task}\n"
-    ).format(thresh=threshold)
+    )
 
 
 def parse_local_assessment(raw_output: str) -> Tuple[Optional[Dict[str, Any]], str]:
@@ -87,10 +89,10 @@ def parse_local_assessment(raw_output: str) -> Tuple[Optional[Dict[str, Any]], s
     if not isinstance(data, dict):
         return None, "invalid_json"
 
-    answer = data.get("answer")
+    answer = data.get("final_answer")
     confidence = data.get("confidence")
-    needs_web = data.get("needs_web")
-    needs_api = data.get("needs_api")
+    escalate_to = data.get("escalate_to")
+    search_query = data.get("search_query")
     uncertainty_reasons = data.get("uncertainty_reasons")
     suggested_query = data.get("suggested_search_query")
 
@@ -98,7 +100,11 @@ def parse_local_assessment(raw_output: str) -> Tuple[Optional[Dict[str, Any]], s
         return None, "invalid_json"
     if not isinstance(confidence, (int, float)) or confidence < 0.0 or confidence > 1.0:
         return None, "invalid_json"
-    if not isinstance(needs_web, bool) or not isinstance(needs_api, bool):
+    if not isinstance(escalate_to, str) or escalate_to not in ("none", "web", "api"):
+        return None, "invalid_json"
+    if search_query is None:
+        search_query = ""
+    if not isinstance(search_query, str):
         return None, "invalid_json"
     if not isinstance(uncertainty_reasons, list) or not all(isinstance(r, str) for r in uncertainty_reasons):
         return None, "invalid_json"
@@ -108,10 +114,10 @@ def parse_local_assessment(raw_output: str) -> Tuple[Optional[Dict[str, Any]], s
         return None, "invalid_json"
 
     return {
-        "answer": answer.strip(),
+        "final_answer": answer.strip(),
         "confidence": float(confidence),
-        "needs_web": bool(needs_web),
-        "needs_api": bool(needs_api),
+        "escalate_to": escalate_to,
+        "search_query": search_query.strip(),
         "uncertainty_reasons": [r.strip() for r in uncertainty_reasons if r.strip()],
         "suggested_search_query": suggested_query.strip(),
     }, ""
@@ -135,30 +141,28 @@ def decide_general_route(
     if assessment is None:
         return result
 
-    confidence_used = min(float(assessment.get("confidence", 0.0) or 0.0), learned_confidence)
+    model_confidence = float(assessment.get("confidence", 0.0) or 0.0)
+    if learned_confidence > 0.0:
+        confidence_used = min(model_confidence, learned_confidence)
+    else:
+        confidence_used = model_confidence
     result["confidence"] = confidence_used
 
     uncertainty_reasons = assessment.get("uncertainty_reasons") or []
-    needs_web = bool(assessment.get("needs_web"))
-    needs_api = bool(assessment.get("needs_api"))
+    escalate_to = assessment.get("escalate_to", "none")
 
     if uncertainty_reasons:
         result["reason"] = "uncertainty_reasons"
         result["route"] = "web" if factual else "api"
         return result
 
-    if needs_web and needs_api:
-        result["reason"] = "needs_web_and_api"
-        result["route"] = "web_api"
-        return result
-
-    if needs_web:
-        result["reason"] = "needs_web"
+    if escalate_to == "web":
+        result["reason"] = "escalate_web"
         result["route"] = "web"
         return result
 
-    if needs_api:
-        result["reason"] = "needs_api"
+    if escalate_to == "api":
+        result["reason"] = "escalate_api"
         result["route"] = "api"
         return result
 
@@ -191,3 +195,13 @@ def summarize_evidence(results: List[Dict[str, str]]) -> str:
         url = item.get("url", "").strip()
         lines.append(f"- {title} | {snippet} | {url}")
     return "\n".join(lines)
+
+
+def build_local_evidence_prompt(task: str, evidence: str) -> str:
+    return (
+        "You are a local model. Use the evidence to answer the task.\n"
+        "If evidence is insufficient, say so.\n"
+        "Cite sources by URL in the answer.\n\n"
+        f"Task:\n{task}\n\n"
+        f"Evidence:\n{evidence}\n"
+    )
