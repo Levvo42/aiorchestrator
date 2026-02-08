@@ -30,9 +30,6 @@ def web_search_google_status(query: str, num_results: int = 3) -> Tuple[List[Dic
     if not query:
         return [], "empty_query", "empty_query"
 
-    if load_dotenv:
-        load_dotenv()
-
     try:
         api_key = require_env_var("GOOGLE_CSE_API_KEY")
         cx = require_env_var("GOOGLE_CSE_CX")
