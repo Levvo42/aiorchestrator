@@ -385,7 +385,10 @@ if __name__ == "__main__":
 
                 # ✅ If apply failed, offer auto-fix + re-propose BEFORE doing anything else.
                 if not pending_dev_report["apply"].get("applied"):
-                    if _prompt_yes_no("Attempt auto-fix and re-propose a patch? (yes/no) "):
+                    fix_depth = int((pending_dev_report.get("fix", {}) or {}).get("depth", 0) or 0)
+                    if fix_depth >= 1:
+                        print("Auto-fix already attempted for this request; not repeating.")
+                    elif _prompt_yes_no("Attempt auto-fix and re-propose a patch? (yes/no) "):
                         _show_dev_progress("fix", "Requesting auto-fix proposal")
                         fix_report = run_dev_fix_request(
                             repo_root=".",

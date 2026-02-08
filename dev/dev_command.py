@@ -51,6 +51,20 @@ def apply_dev_patch(repo_root: str, report: dict, **kwargs):
 
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
 _DIFF_GIT_RE = re.compile(r"^diff --git a\/(.+) b\/(.+)$")
+_INDEX_RE = re.compile(r"^index [0-9a-f]{7,}\.\.[0-9a-f]{7,}(?: \d{6})?$")
+_META_PREFIXES = (
+    "old mode ",
+    "new mode ",
+    "deleted file mode ",
+    "new file mode ",
+    "copy from ",
+    "copy to ",
+    "rename from ",
+    "rename to ",
+    "similarity index ",
+    "dissimilarity index ",
+    "index ",
+)
 
 def _strip_markdown_fences(text: str) -> str:
     t = (text or "").strip()
@@ -152,6 +166,21 @@ def _validate_unified_diff(diff_text: str) -> Tuple[bool, str]:
                     if not (saw_minus and saw_plus):
                         return False, "Orphan hunk '@@' before file headers '---'/'+++'."
                     saw_hunk = True
+                elif saw_hunk:
+                    # Once hunks begin, only hunk lines are allowed.
+                    if not (l.startswith(" ") or l.startswith("+") or l.startswith("-") or l.startswith("\\")):
+                        return False, f"Unexpected line after hunks started: '{l}'"
+                else:
+                    # Pre-hunk metadata lines we allow; reject anything else to avoid corrupt patches.
+                    if l.startswith("index "):
+                        if not _INDEX_RE.match(l.strip()):
+                            return False, f"Malformed index line: '{l}'"
+                    elif any(l.startswith(p) for p in _META_PREFIXES):
+                        pass
+                    elif l.startswith("Binary files ") or l.startswith("GIT binary patch"):
+                        return False, "Binary patches are not supported."
+                    else:
+                        return False, f"Unexpected line before hunks: '{l}'"
 
                 i += 1
 
@@ -475,23 +504,46 @@ def run_dev_fix_request(
     original_request = str(failed_report.get("request", "")).strip()
     failed_patch = str(failed_report.get("chosen_patch", "")).strip()
     apply_error = str((failed_report.get("apply", {}) or {}).get("error", "")).strip()
+    prev_fix = failed_report.get("fix", {}) or {}
+    original_patch = str(prev_fix.get("original_patch") or failed_patch).strip()
+    original_error = str(prev_fix.get("original_error") or apply_error).strip()
+    fix_depth = int(prev_fix.get("depth", 0) or 0) + 1
 
     context = build_context_bundle(repo_root=repo_root, request=original_request)
 
     policy = DevPolicy(capabilities)
     provider_stats = memory.get_provider_stats()
 
+    dev_min = memory.get_setting("dev_min_authors", None) or 1
+    dev_max = memory.get_setting("dev_max_authors", None) or 2
+    dev_max = min(int(dev_max), 2)
+    dev_min = min(int(dev_min), dev_max)
+
     decision = policy.decide(
         provider_stats=provider_stats,
-        settings={},
-        determinism_key=f"{_git_head(repo_root)}\nFIX_APPLY\n{original_request}\n{apply_error[:300]}",
+        settings={
+            "dev_mode": memory.get_setting("dev_mode", "auto"),
+            "dev_authors": memory.get_setting("dev_authors", None),
+            "dev_judge_provider": memory.get_setting("dev_judge_provider", None),
+            "dev_min_authors": dev_min,
+            "dev_max_authors": dev_max,
+            "dev_exploration_rate": memory.get_setting("dev_exploration_rate", None),
+        },
+        determinism_key=f"{_git_head(repo_root)}\nFIX_APPLY\n{original_request}\n{original_error[:300]}",
     )
+
+    decision.author_providers = _prefer_dev_providers(decision.author_providers, provider_map)
+    if not decision.author_providers:
+        runtime = sorted(provider_map.keys())
+        devs = [p for p in runtime if p.endswith("_dev")]
+        decision.author_providers = devs[:2] if devs else runtime[:2]
+    decision.author_providers = decision.author_providers[:dev_max]
 
     author_prompt = build_fix_author_prompt(
         request=original_request,
         context=context,
-        failed_patch=failed_patch,
-        apply_error=apply_error,
+        failed_patch=original_patch,
+        apply_error=original_error,
     )
 
     author_outputs = []
@@ -519,6 +571,13 @@ def run_dev_fix_request(
             "reason": "FIX_APPLY",
         },
         "chosen_patch": chosen_patch,
+        "fix": {
+            "depth": fix_depth,
+            "original_patch": original_patch,
+            "original_error": original_error,
+            "source_patch": failed_patch,
+            "source_error": apply_error,
+        },
         "apply": {
             "attempted": False,
             "applied": False,
