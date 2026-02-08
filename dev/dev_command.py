@@ -28,13 +28,29 @@ from dev.patch_apply import apply_patches
 from dev.validate import py_compile_files, run_tests_if_available
 
 
+# python
+# Add to the top of dev/dev_command.py if the real functions have different signatures.
+# These wrappers accept the parameters used by main.py and forward them.
+
+def run_dev_request(repo_root: str, request: str, capabilities: dict, memory, provider_map=None, **kwargs):
+    # forward to actual implementation (replace `_run_dev_request` with the real function name if different)
+    return _run_dev_request(repo_root=repo_root, request=request, capabilities=capabilities, memory=memory, provider_map=provider_map, **kwargs)
+
+def run_dev_fix_request(repo_root: str, failed_report: dict, capabilities: dict, memory, provider_map=None, **kwargs):
+    # forward to actual implementation (replace `_run_dev_fix_request` with the real function name if different)
+    return _run_dev_fix_request(repo_root=repo_root, failed_report=failed_report, capabilities=capabilities, memory=memory, provider_map=provider_map, **kwargs)
+
+def apply_dev_patch(repo_root: str, report: dict, **kwargs):
+    # forward to actual implementation (replace `_apply_dev_patch` with the real function name if different)
+    return _apply_dev_patch(repo_root=repo_root, report=report, **kwargs)
+
+
 # ----------------------------
 # Patch parsing / validation
 # ----------------------------
 
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
 _DIFF_GIT_RE = re.compile(r"^diff --git a\/(.+) b\/(.+)$")
-
 
 def _strip_markdown_fences(text: str) -> str:
     t = (text or "").strip()
