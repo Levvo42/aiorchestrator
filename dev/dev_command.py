@@ -50,6 +50,7 @@ def apply_dev_patch(repo_root: str, report: dict, **kwargs):
 # ----------------------------
 
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
+_HUNK_PARSE_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _DIFF_GIT_RE = re.compile(r"^diff --git a\/(.+) b\/(.+)$")
 _INDEX_RE = re.compile(r"^index [0-9a-f]{7,}\.\.[0-9a-f]{7,}(?: \d{6})?$")
 _META_PREFIXES = (
@@ -141,6 +142,9 @@ def _validate_unified_diff(diff_text: str) -> Tuple[bool, str]:
             saw_minus = False
             saw_plus = False
             saw_hunk = False
+            in_hunk = False
+            hunk_old_remaining = 0
+            hunk_new_remaining = 0
 
             i += 1
             while i < len(lines) and not lines[i].startswith("diff --git "):
@@ -165,11 +169,31 @@ def _validate_unified_diff(diff_text: str) -> Tuple[bool, str]:
                     # Critical rule: hunks only allowed AFTER both file headers
                     if not (saw_minus and saw_plus):
                         return False, "Orphan hunk '@@' before file headers '---'/'+++'."
+                    m_hunk = _HUNK_PARSE_RE.match(l)
+                    if not m_hunk:
+                        return False, f"Malformed hunk header: '{l}'"
+                    old_count = int(m_hunk.group(2) or "1")
+                    new_count = int(m_hunk.group(4) or "1")
+                    hunk_old_remaining = old_count
+                    hunk_new_remaining = new_count
+                    in_hunk = True
                     saw_hunk = True
-                elif saw_hunk:
-                    # Once hunks begin, only hunk lines are allowed.
-                    if not (l.startswith(" ") or l.startswith("+") or l.startswith("-") or l.startswith("\\")):
-                        return False, f"Unexpected line after hunks started: '{l}'"
+                elif in_hunk:
+                    if l.startswith("\\ No newline at end of file"):
+                        pass
+                    elif l.startswith(" "):
+                        hunk_old_remaining -= 1
+                        hunk_new_remaining -= 1
+                    elif l.startswith("-"):
+                        hunk_old_remaining -= 1
+                    elif l.startswith("+"):
+                        hunk_new_remaining -= 1
+                    else:
+                        return False, f"Unexpected line inside hunk: '{l}'"
+                    if hunk_old_remaining < 0 or hunk_new_remaining < 0:
+                        return False, "Hunk line counts do not match header."
+                    if hunk_old_remaining == 0 and hunk_new_remaining == 0:
+                        in_hunk = False
                 else:
                     # Pre-hunk metadata lines we allow; reject anything else to avoid corrupt patches.
                     if l.startswith("index "):
@@ -184,6 +208,8 @@ def _validate_unified_diff(diff_text: str) -> Tuple[bool, str]:
 
                 i += 1
 
+            if in_hunk:
+                return False, "Hunk line counts do not match header."
             if not (saw_minus and saw_plus):
                 return False, "Missing '--- a/...' and/or '+++ b/...' in a diff block."
             if not saw_hunk:
@@ -197,6 +223,23 @@ def _validate_unified_diff(diff_text: str) -> Tuple[bool, str]:
     if blocks == 0:
         return False, "No diff blocks found."
 
+    return True, "OK"
+
+def _check_patch_applies(repo_root: str, diff_text: str) -> Tuple[bool, str]:
+    try:
+        completed = subprocess.run(
+            ["git", "apply", "--check", "--whitespace=nowarn", "--recount"],
+            cwd=repo_root,
+            input=diff_text,
+            encoding="utf-8",
+            capture_output=True,
+            check=False,
+        )
+    except Exception as e:
+        return False, str(e)
+    if completed.returncode != 0:
+        msg = (completed.stderr or completed.stdout or "").strip()
+        return False, msg or "Patch does not apply cleanly."
     return True, "OK"
 
 def _extract_changed_files(diff_text: str) -> List[str]:
@@ -385,6 +428,16 @@ def run_dev_request(
                     }
                 )
                 continue
+            ok, why = _check_patch_applies(repo_root=repo_root, diff_text=patch_text)
+            if not ok:
+                author_outputs.append(
+                    {
+                        "provider": provider_name,
+                        "success": False,
+                        "error": f"Rejected non-applying diff: {why}",
+                    }
+                )
+                continue
 
             author_outputs.append({"provider": provider_name, "success": True, "patch": patch_text})
 
@@ -555,7 +608,9 @@ def run_dev_fix_request(
             patch = _strip_markdown_fences(client.generate(author_prompt))
             ok, _ = _validate_unified_diff(patch)
             if ok:
-                author_outputs.append(patch)
+                ok, _ = _check_patch_applies(repo_root=repo_root, diff_text=patch)
+                if ok:
+                    author_outputs.append(patch)
         except Exception:
             pass
 

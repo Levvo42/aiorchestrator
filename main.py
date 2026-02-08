@@ -337,6 +337,7 @@ if __name__ == "__main__":
     # Holds a dev report that has been proposed but not yet confirmed/applied.
     pending_dev_report = None
     last_applied_dev_report = None
+    pending_dev_invalid_shown = False
 
 
     print("AI-Orchestrator v0.2 (with Judge)")
@@ -366,6 +367,7 @@ if __name__ == "__main__":
             answer = text.strip().lower()
 
             if answer in ("y", "yes"):
+                pending_dev_invalid_shown = False
                 # Store the report before applying so we can reference it for commits
                 last_applied_dev_report = pending_dev_report
 
@@ -475,12 +477,15 @@ if __name__ == "__main__":
                 continue
 
             if answer in ("n", "no"):
+                pending_dev_invalid_shown = False
                 print("Patch not applied.")
                 pending_dev_report = None
                 continue
 
             # If they typed something else, keep waiting for a valid yes/no
-            print("Please answer: yes or no")
+            if not pending_dev_invalid_shown and answer:
+                print("Please answer: yes or no")
+                pending_dev_invalid_shown = True
             continue
 
         # -------------------
@@ -523,6 +528,7 @@ if __name__ == "__main__":
             print(report["chosen_patch"] or "(no patch produced)")
 
             pending_dev_report = report
+            pending_dev_invalid_shown = False
             print("\nApply patch? (yes/no):")
             continue
 

@@ -8,6 +8,7 @@ from typing import Dict, List
 
 _INDEX_OK = re.compile(r"^index [0-9a-f]{7,}\.\.[0-9a-f]{7,}(?: \d{6})?$")
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
+_HUNK_PARSE_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _DIFF_GIT_RE = re.compile(r"^diff --git a\/(.+) b\/(.+)$")
 _META_PREFIXES = (
     "old mode ",
@@ -51,6 +52,9 @@ def _validate_unified_diff(diff_text: str) -> None:
             saw_minus = False
             saw_plus = False
             saw_hunk = False
+            in_hunk = False
+            hunk_old_remaining = 0
+            hunk_new_remaining = 0
 
             i += 1
             while i < len(lines) and not lines[i].startswith("diff --git "):
@@ -70,10 +74,31 @@ def _validate_unified_diff(diff_text: str) -> None:
                 elif _HUNK_RE.match(l):
                     if not (saw_minus and saw_plus):
                         raise RuntimeError("Refusing to apply patch: hunk before file headers.")
+                    m_hunk = _HUNK_PARSE_RE.match(l)
+                    if not m_hunk:
+                        raise RuntimeError(f"Refusing to apply patch: malformed hunk header '{l}'.")
+                    old_count = int(m_hunk.group(2) or "1")
+                    new_count = int(m_hunk.group(4) or "1")
+                    hunk_old_remaining = old_count
+                    hunk_new_remaining = new_count
+                    in_hunk = True
                     saw_hunk = True
-                elif saw_hunk:
-                    if not (l.startswith(" ") or l.startswith("+") or l.startswith("-") or l.startswith("\\")):
-                        raise RuntimeError(f"Refusing to apply patch: unexpected line after hunks '{l}'.")
+                elif in_hunk:
+                    if l.startswith("\\ No newline at end of file"):
+                        pass
+                    elif l.startswith(" "):
+                        hunk_old_remaining -= 1
+                        hunk_new_remaining -= 1
+                    elif l.startswith("-"):
+                        hunk_old_remaining -= 1
+                    elif l.startswith("+"):
+                        hunk_new_remaining -= 1
+                    else:
+                        raise RuntimeError(f"Refusing to apply patch: unexpected line inside hunk '{l}'.")
+                    if hunk_old_remaining < 0 or hunk_new_remaining < 0:
+                        raise RuntimeError("Refusing to apply patch: hunk line counts do not match header.")
+                    if hunk_old_remaining == 0 and hunk_new_remaining == 0:
+                        in_hunk = False
                 else:
                     if l.startswith("index "):
                         if not _INDEX_OK.match(l.strip()):
@@ -86,6 +111,8 @@ def _validate_unified_diff(diff_text: str) -> None:
                         raise RuntimeError(f"Refusing to apply patch: unexpected pre-hunk line '{l}'.")
 
                 i += 1
+            if in_hunk:
+                raise RuntimeError("Refusing to apply patch: hunk line counts do not match header.")
             continue
 
         i += 1
