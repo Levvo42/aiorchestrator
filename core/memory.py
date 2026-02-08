@@ -18,16 +18,43 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 
+def _default_local_judge_bucket() -> Dict[str, Any]:
+    return {
+        "local_decisions": 0,
+        "local_escalations": 0,
+        "local_json_total": 0,
+        "local_json_valid": 0,
+        "local_valid_json_rate": 0.0,
+        "local_vs_api_compared": 0,
+        "local_vs_api_agreement": 0,
+        "local_vs_api_agreement_rate": 0.0,
+        "post_apply_local_total": 0,
+        "post_apply_local_success": 0,
+        "post_apply_local_success_rate": 0.0,
+        "post_apply_api_total": 0,
+        "post_apply_api_success": 0,
+        "post_apply_api_success_rate": 0.0,
+        "confidence": 0.0,
+    }
+
+
 DEFAULT_STATE: Dict[str, Any] = {
     "runs": [],
     "provider_stats": {},
+    "local_judge_stats": {
+        "overall": _default_local_judge_bucket(),
+        "per_intent": {},
+        "per_provider": {},
+    },
     "notes": [],
     "settings": {
         "judge_mode": "auto",
         "judge_provider": None,
+        "judge_threshold": 0.90,
         "dev_mode": "auto",
         "dev_authors": None,
         "dev_judge_provider": None,
+        "dev_judge_mode": None,
         "dev_min_authors": None,
         "dev_max_authors": None,
         "dev_exploration_rate": None,
@@ -94,6 +121,7 @@ class MemoryStore:
 
         self.state.setdefault("runs", [])
         self.state.setdefault("provider_stats", {})
+        self.state.setdefault("local_judge_stats", {})
         self.state.setdefault("notes", [])
         self.state.setdefault("settings", {})
 
@@ -105,17 +133,28 @@ class MemoryStore:
         # Judge settings
         settings.setdefault("judge_mode", "auto")
         settings.setdefault("judge_provider", None)
+        settings.setdefault("judge_threshold", 0.90)
 
         # Dev settings
         settings.setdefault("dev_mode", "auto")
         settings.setdefault("dev_authors", None)
         settings.setdefault("dev_judge_provider", None)
+        settings.setdefault("dev_judge_mode", None)
         settings.setdefault("dev_min_authors", None)
         settings.setdefault("dev_max_authors", None)
         settings.setdefault("dev_exploration_rate", None)
 
         # Other settings
         settings.setdefault("verbosity", "full")
+
+        local_stats = self.state.get("local_judge_stats")
+        if not isinstance(local_stats, dict):
+            local_stats = {}
+            self.state["local_judge_stats"] = local_stats
+
+        local_stats.setdefault("overall", _default_local_judge_bucket())
+        local_stats.setdefault("per_intent", {})
+        local_stats.setdefault("per_provider", {})
 
     # -----------------------
     # Run logging
@@ -145,6 +184,123 @@ class MemoryStore:
     def get_provider_stats(self) -> Dict[str, Any]:
         """Return provider stats dictionary."""
         return self.state.get("provider_stats", {})
+
+    # -----------------------
+    # Local judge stats
+    # -----------------------
+
+    def get_local_judge_stats(self) -> Dict[str, Any]:
+        """Return local judge stats dictionary."""
+        return self.state.get("local_judge_stats", {})
+
+    def update_local_judge_stats(self, info: Dict[str, Any], apply_result: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Update local judge stats after a dev apply attempt.
+
+        Expected info shape (keys are optional):
+          - intent, local_provider, api_provider
+          - local_attempted, local_valid_json, escalated
+          - local_patch_index, api_patch_index
+          - selected_source ("local"|"api"|...)
+        """
+        if not isinstance(info, dict):
+            return
+
+        local_stats = self.state.setdefault("local_judge_stats", {})
+        overall = local_stats.setdefault("overall", _default_local_judge_bucket())
+        per_intent = local_stats.setdefault("per_intent", {})
+        per_provider = local_stats.setdefault("per_provider", {})
+
+        intent = str(info.get("intent") or "general_judge")
+        local_provider = str(info.get("local_provider") or "ollama_local")
+        api_provider = str(info.get("api_provider") or "")
+
+        intent_bucket = per_intent.setdefault(intent, _default_local_judge_bucket())
+        local_bucket = per_provider.setdefault(local_provider, _default_local_judge_bucket())
+        api_bucket = per_provider.setdefault(api_provider, _default_local_judge_bucket()) if api_provider else None
+
+        def _local_buckets():
+            return [overall, intent_bucket, local_bucket]
+
+        def _api_buckets():
+            buckets = [overall, intent_bucket]
+            if api_bucket is not None:
+                buckets.append(api_bucket)
+            return buckets
+
+        local_attempted = bool(info.get("local_attempted"))
+        local_valid_json = bool(info.get("local_valid_json"))
+        escalated = bool(info.get("escalated"))
+        local_patch_index = info.get("local_patch_index")
+        api_patch_index = info.get("api_patch_index")
+        selected_source = str(info.get("selected_source") or "")
+
+        if local_attempted:
+            for b in _local_buckets():
+                b["local_decisions"] += 1
+                b["local_json_total"] += 1
+                if local_valid_json:
+                    b["local_json_valid"] += 1
+                if escalated:
+                    b["local_escalations"] += 1
+
+        if escalated and isinstance(local_patch_index, int) and isinstance(api_patch_index, int):
+            for b in _local_buckets():
+                b["local_vs_api_compared"] += 1
+                if local_patch_index == api_patch_index:
+                    b["local_vs_api_agreement"] += 1
+
+        apply_ok = False
+        if isinstance(apply_result, dict):
+            apply_ok = bool(apply_result.get("applied")) and bool(apply_result.get("validation_ok"))
+
+        if selected_source == "local":
+            for b in _local_buckets():
+                b["post_apply_local_total"] += 1
+                if apply_ok:
+                    b["post_apply_local_success"] += 1
+        elif selected_source == "api":
+            for b in _api_buckets():
+                b["post_apply_api_total"] += 1
+                if apply_ok:
+                    b["post_apply_api_success"] += 1
+
+        def _update_rates(bucket: Dict[str, Any]) -> None:
+            json_total = bucket.get("local_json_total", 0) or 0
+            json_valid = bucket.get("local_json_valid", 0) or 0
+            bucket["local_valid_json_rate"] = (json_valid / json_total) if json_total else 0.0
+
+            vs_total = bucket.get("local_vs_api_compared", 0) or 0
+            vs_agree = bucket.get("local_vs_api_agreement", 0) or 0
+            bucket["local_vs_api_agreement_rate"] = (vs_agree / vs_total) if vs_total else 0.0
+
+            local_total = bucket.get("post_apply_local_total", 0) or 0
+            local_success = bucket.get("post_apply_local_success", 0) or 0
+            bucket["post_apply_local_success_rate"] = (local_success / local_total) if local_total else 0.0
+
+            api_total = bucket.get("post_apply_api_total", 0) or 0
+            api_success = bucket.get("post_apply_api_success", 0) or 0
+            bucket["post_apply_api_success_rate"] = (api_success / api_total) if api_total else 0.0
+
+        touched = set()
+        for b in _local_buckets():
+            touched.add(id(b))
+            _update_rates(b)
+        for b in _api_buckets():
+            if id(b) in touched:
+                continue
+            _update_rates(b)
+
+        # Confidence update (conservative)
+        if escalated and isinstance(local_patch_index, int) and isinstance(api_patch_index, int):
+            if local_patch_index == api_patch_index and apply_ok:
+                for b in _local_buckets():
+                    b["confidence"] = min(1.0, float(b.get("confidence", 0.0) or 0.0) + 0.05)
+        if selected_source == "local" and not apply_ok:
+            for b in _local_buckets():
+                b["confidence"] = max(0.0, float(b.get("confidence", 0.0) or 0.0) - 0.30)
+
+        self._save()
 
     # -----------------------
     # Settings

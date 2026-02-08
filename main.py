@@ -60,7 +60,8 @@ def handle_command(text: str, memory: MemoryStore,
         lines = ["Dev settings:"]
         keys = [
             "dev_mode", "dev_authors", "dev_judge_provider",
-            "dev_min_authors", "dev_max_authors", "dev_exploration_rate"
+            "dev_min_authors", "dev_max_authors", "dev_exploration_rate",
+            "dev_judge_mode"
         ]
         for k in keys:
             lines.append(f"- {k}: {cfg.get(k)}")
@@ -72,6 +73,13 @@ def handle_command(text: str, memory: MemoryStore,
             return "Invalid. Use: Set Dev Mode: auto | fixed"
         memory.set_setting("dev_mode", mode)
         return f"Dev mode set to: {mode}"
+
+    if t.lower().startswith("set dev judge mode:"):
+        mode = t.split(":", 1)[1].strip().lower()
+        if mode not in ("auto", "local_only", "api_only"):
+            return "Invalid. Use: Set Dev Judge Mode: auto | local_only | api_only"
+        memory.set_setting("dev_judge_mode", mode)
+        return f"Dev judge mode set to: {mode}"
 
     if t.lower().startswith("set dev judge:"):
         provider = t.split(":", 1)[1].strip().lower()
@@ -124,13 +132,15 @@ def handle_command(text: str, memory: MemoryStore,
             "  Show Settings\n"
             "  Show Judge\n"
             "  Set Judge: <provider>\n"
-            "  Set Judge Mode: auto | fixed\n"
+            "  Set Judge Mode: auto | fixed | local_only | api_only\n"
+            "  Set Judge Threshold: <0..1>\n"
             "  Set Verbosity: full | normal | final\n"
             "\nDev workflow:\n"
             "  Dev: <request>\n"
             "  Show Dev Settings\n"
             "  Set Dev Mode: auto | fixed\n"
             "  Set Dev Judge: <provider>\n"
+            "  Set Dev Judge Mode: auto | local_only | api_only\n"
             "  Set Dev Authors: a, b, c\n"
             "  Dev: Commit with message \"<msg>\"\n"
             "\nExamples:\n"
@@ -147,8 +157,8 @@ def handle_command(text: str, memory: MemoryStore,
     # Set Judge Mode: auto/fixed
     if t.lower().startswith("set judge mode:"):
         mode = t.split(":", 1)[1].strip().lower()
-        if mode not in ("auto", "fixed"):
-            return "Invalid judge mode. Use: Set Judge Mode: auto  OR  Set Judge Mode: fixed"
+        if mode not in ("auto", "fixed", "local_only", "api_only"):
+            return "Invalid judge mode. Use: Set Judge Mode: auto | fixed | local_only | api_only"
 
         memory.set_setting("judge_mode", mode)
 
@@ -157,6 +167,17 @@ def handle_command(text: str, memory: MemoryStore,
             memory.set_setting("judge_provider", None)
 
         return f"Judge mode set to: {mode}"
+
+    if t.lower().startswith("set judge threshold:"):
+        raw = t.split(":", 1)[1].strip()
+        try:
+            value = float(raw)
+        except ValueError:
+            return "Invalid judge threshold. Use a number between 0 and 1."
+        if value < 0.0 or value > 1.0:
+            return "Invalid judge threshold. Use a number between 0 and 1."
+        memory.set_setting("judge_threshold", value)
+        return f"Judge threshold set to: {value}"
 
     # Set Judge: provider_name (puts mode into fixed)
     if t.lower().startswith("set judge:"):
@@ -425,6 +446,26 @@ if __name__ == "__main__":
                         memory.update_provider_stats(j_provider, success=j_success)
                 except Exception:
                     # Stats should never break the dev flow.
+                    pass
+
+                try:
+                    local_info = pending_dev_report.get("local_judge", {}) or {}
+                    apply_result = pending_dev_report.get("apply", {}) or {}
+                    memory.update_local_judge_stats(
+                        info={
+                            "intent": local_info.get("intent"),
+                            "local_provider": local_info.get("local_provider"),
+                            "api_provider": local_info.get("api_provider"),
+                            "local_attempted": (local_info.get("local") or {}).get("attempted"),
+                            "local_valid_json": (local_info.get("local") or {}).get("valid_json"),
+                            "escalated": (local_info.get("local") or {}).get("escalated"),
+                            "local_patch_index": (local_info.get("local") or {}).get("patch_index"),
+                            "api_patch_index": (local_info.get("api") or {}).get("patch_index"),
+                            "selected_source": local_info.get("selected_source"),
+                        },
+                        apply_result=apply_result,
+                    )
+                except Exception:
                     pass
 
                 # Store dev run in memory

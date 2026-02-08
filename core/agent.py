@@ -39,6 +39,7 @@ from tools.local_exec import read_file, write_file, list_dir
 from providers.openai_client import OpenAIClient
 from providers.openai_responses_client import OpenAIResponsesClient
 from providers.claude_client import ClaudeClient
+from providers.ollama_client import OllamaClient
 
 # If you have a Gemini client, import it here.
 # If you DON'T have it, keep it commented out to avoid import errors.
@@ -126,6 +127,15 @@ class Agent:
             provider_map["claude_dev"] = ClaudeClient(
                 model=os.getenv("ANTHROPIC_DEV_MODEL", "claude-sonnet-4-5"),
                 temperature=0.0,
+            )
+
+        # ----------------------------
+        # Ollama (local)
+        # ----------------------------
+        if self._provider_enabled_in_capabilities("ollama_local"):
+            provider_map["ollama_local"] = OllamaClient(
+                base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+                model=os.getenv("OLLAMA_MODEL", "gpt-oss:20b"),
             )
 
         # ----------------------------

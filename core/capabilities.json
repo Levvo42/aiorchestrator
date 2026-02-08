@@ -71,6 +71,20 @@
     "latency_tier": "medium",
 
     "notes": "Developer-grade Claude for self-patching/judging."
+  },
+
+  "ollama_local": {
+    "enabled": true,
+    "env_key_required": null,
+    "default_model": "gpt-oss:20b",
+
+    "strengths": ["general", "code", "local"],
+    "judge_strengths": ["general_judge", "code_judge", "comparison_judge"],
+
+    "cost_tier": "low",
+    "latency_tier": "fast",
+
+    "notes": "Local Ollama model via http://localhost:11434 (no API key required)."
   }
 },
 

@@ -9,8 +9,16 @@ Correctness-first dev patching:
 - Apply requires explicit user confirmation (handled in main.py).
 - After apply: compile + tests (if available).
 
-Judge contract (STRICT JSON):
+Judge contract (STRICT JSON, API judge):
 {"patch_index": <int>, "rationale": "<short text>"}
+
+Local judge contract (STRICT JSON, Ollama):
+{
+  "patch_index": <int or null>,
+  "confidence": <number 0..1>,
+  "uncertainty_reasons": ["..."],
+  "rationale": "short"
+}
 """
 
 from __future__ import annotations
@@ -23,7 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from dev.context import build_context_bundle
 from dev.policy import DevPolicy
-from dev.prompts import build_author_prompt, build_fix_author_prompt, build_judge_prompt
+from dev.prompts import build_author_prompt, build_fix_author_prompt, build_judge_prompt, build_local_judge_prompt
 from dev.patch_apply import apply_patches
 from dev.validate import py_compile_files, run_tests_if_available
 
@@ -67,6 +75,9 @@ _META_PREFIXES = (
     "index ",
 )
 
+LOCAL_JUDGE_PROVIDER = "ollama_local"
+LOCAL_JUDGE_RISKY_PATHS = ("core/", "dev/", "providers/", "main.py")
+
 def _strip_markdown_fences(text: str) -> str:
     t = (text or "").strip()
 
@@ -90,6 +101,208 @@ def _safe_json_load(s: str) -> Optional[dict]:
         return json.loads(s)
     except Exception:
         return None
+
+
+def _infer_intent(request: str, capabilities: dict) -> str:
+    t = (request or "").lower()
+    judge_cfg = capabilities.get("judge", {})
+    intent_keywords = judge_cfg.get("task_intent_keywords", {})
+
+    for intent, keywords in intent_keywords.items():
+        for kw in keywords:
+            if kw.lower() in t:
+                return intent
+    return "general_judge"
+
+
+def _normalize_judge_mode(mode: Optional[str]) -> str:
+    if not mode:
+        return "auto"
+    m = str(mode).strip().lower()
+    if m in ("auto", "local_only", "api_only"):
+        return m
+    if m == "fixed":
+        return "api_only"
+    return "auto"
+
+
+def _clamp_threshold(value: Any, default: float = 0.90) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    if v < 0.0:
+        return 0.0
+    if v > 1.0:
+        return 1.0
+    return v
+
+
+def _get_learned_confidence(stats: Dict[str, Any], intent: str, provider: str) -> float:
+    per_intent = stats.get("per_intent", {}).get(intent, {})
+    per_provider = stats.get("per_provider", {}).get(provider, {})
+    intent_conf = float(per_intent.get("confidence", 0.0) or 0.0)
+    provider_conf = float(per_provider.get("confidence", 0.0) or 0.0)
+    return min(intent_conf, provider_conf)
+
+
+def _parse_local_judge_output(raw_output: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    data = _safe_json_load(raw_output)
+    if not isinstance(data, dict):
+        return None, "invalid_json"
+
+    patch_index = data.get("patch_index")
+    if patch_index is not None and not isinstance(patch_index, int):
+        return None, "invalid_json"
+
+    confidence = data.get("confidence")
+    if not isinstance(confidence, (int, float)):
+        return None, "invalid_json"
+    confidence = float(confidence)
+    if confidence < 0.0 or confidence > 1.0:
+        return None, "invalid_json"
+
+    uncertainty_reasons = data.get("uncertainty_reasons")
+    if not isinstance(uncertainty_reasons, list) or not all(isinstance(r, str) for r in uncertainty_reasons):
+        return None, "invalid_json"
+
+    rationale = data.get("rationale", "")
+    if not isinstance(rationale, str):
+        return None, "invalid_json"
+
+    return {
+        "patch_index": patch_index,
+        "confidence": confidence,
+        "uncertainty_reasons": uncertainty_reasons,
+        "rationale": rationale.strip(),
+    }, ""
+
+
+def _patch_touches_risky_paths(patch_text: str) -> bool:
+    for path in _extract_changed_files(patch_text):
+        if path == "main.py":
+            return True
+        for prefix in LOCAL_JUDGE_RISKY_PATHS:
+            if path.startswith(prefix):
+                return True
+    return False
+
+
+def _evaluate_local_judge_output(
+    raw_output: str,
+    candidate_patch_texts: List[str],
+    threshold: float,
+    learned_confidence: float,
+) -> Dict[str, Any]:
+    decision: Dict[str, Any] = {
+        "valid_json": False,
+        "patch_index": None,
+        "confidence": 0.0,
+        "model_confidence": 0.0,
+        "learned_confidence": learned_confidence,
+        "uncertainty_reasons": [],
+        "rationale": "",
+        "escalate": True,
+        "escalation_reason": "invalid_json",
+        "risky_paths": False,
+    }
+
+    parsed, error = _parse_local_judge_output(raw_output)
+    if error:
+        return decision
+
+    decision["valid_json"] = True
+    decision["patch_index"] = parsed["patch_index"]
+    decision["model_confidence"] = parsed["confidence"]
+    decision["uncertainty_reasons"] = parsed["uncertainty_reasons"]
+    decision["rationale"] = parsed["rationale"]
+
+    confidence_used = min(parsed["confidence"], learned_confidence)
+    decision["confidence"] = confidence_used
+
+    if parsed["patch_index"] is None:
+        decision["escalation_reason"] = "patch_index_null"
+        return decision
+
+    if not (0 <= parsed["patch_index"] < len(candidate_patch_texts)):
+        decision["escalation_reason"] = "invalid_patch_index"
+        return decision
+
+    if confidence_used < threshold:
+        decision["escalation_reason"] = "confidence_below_threshold"
+        return decision
+
+    if parsed["uncertainty_reasons"]:
+        decision["escalation_reason"] = "uncertainty_reasons"
+        return decision
+
+    candidate = _strip_markdown_fences(candidate_patch_texts[parsed["patch_index"]].strip())
+    decision["risky_paths"] = _patch_touches_risky_paths(candidate)
+    if decision["risky_paths"] and confidence_used < 1.0:
+        decision["escalation_reason"] = "risky_paths"
+        return decision
+
+    decision["escalate"] = False
+    decision["escalation_reason"] = ""
+    return decision
+
+
+def _run_api_judge(
+    judge_client: Any,
+    judge_prompt: str,
+    candidate_patch_texts: List[str],
+    successful_patches: List[Dict[str, Any]],
+) -> Tuple[str, str, bool, str, Optional[int]]:
+    judge_rationale = ""
+    chosen_patch = ""
+    judge_ok = False
+    judge_raw_output = ""
+    api_patch_index: Optional[int] = None
+
+    if not judge_client or not successful_patches:
+        chosen_patch, judge_rationale = _choose_first_valid_patch(successful_patches)
+        if not judge_client:
+            judge_rationale = f"Judge unavailable. {judge_rationale}"
+        else:
+            judge_rationale = f"No successful patches to judge. {judge_rationale}"
+        return chosen_patch, judge_rationale, judge_ok, judge_raw_output, api_patch_index
+
+    try:
+        judge_output = judge_client.generate(judge_prompt)
+        judge_raw_output = judge_output
+        judge_json = _safe_json_load(judge_output)
+
+        if judge_json and "patch_index" in judge_json:
+            idx = judge_json.get("patch_index")
+            judge_rationale = str(judge_json.get("rationale", "")).strip()
+            api_patch_index = idx if isinstance(idx, int) else None
+
+            if isinstance(idx, int) and 0 <= idx < len(candidate_patch_texts):
+                candidate = _strip_markdown_fences(candidate_patch_texts[idx].strip())
+                ok, why = _validate_unified_diff(candidate)
+                if ok:
+                    chosen_patch = candidate
+                    judge_ok = True
+                else:
+                    chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
+                    judge_rationale = (
+                        f"Judge selected patch_index={idx} but patch was invalid ({why}). {fallback_reason}"
+                    )
+            else:
+                chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
+                judge_rationale = f"Judge returned invalid patch_index={idx}. {fallback_reason}"
+        else:
+            chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
+            judge_rationale = (
+                "Judge did not return strict JSON with patch_index; ignored raw judge output. "
+                f"{fallback_reason}\nRaw judge output:\n{judge_output.strip()}"
+            )
+
+    except Exception as e:
+        chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
+        judge_rationale = f"Judge failed: {e}. {fallback_reason}"
+
+    return chosen_patch, judge_rationale, judge_ok, judge_raw_output, api_patch_index
 
 
 def _validate_unified_diff(diff_text: str) -> Tuple[bool, str]:
@@ -350,6 +563,21 @@ def _best_available_judge(preferred: str, provider_map: Dict[str, Any]) -> str:
     return runtime[0]
 
 
+def _best_available_api_judge(preferred: str, provider_map: Dict[str, Any]) -> str:
+    runtime = sorted(p for p in provider_map.keys() if p != LOCAL_JUDGE_PROVIDER)
+    if not runtime:
+        return ""
+    if preferred in runtime:
+        return preferred
+    if any(p.endswith("_dev") for p in runtime):
+        dev_pref = f"{preferred}_dev"
+        if dev_pref in runtime:
+            return dev_pref
+        if "openai_dev" in runtime:
+            return "openai_dev"
+    return runtime[0]
+
+
 # ----------------------------
 # Public API
 # ----------------------------
@@ -375,6 +603,15 @@ def run_dev_request(
         "dev_exploration_rate": memory.get_setting("dev_exploration_rate", None),
     }
 
+    raw_judge_mode = memory.get_setting("dev_judge_mode", None)
+    if raw_judge_mode is None:
+        raw_judge_mode = memory.get_setting("judge_mode", "auto")
+    judge_mode = _normalize_judge_mode(raw_judge_mode)
+    judge_threshold = _clamp_threshold(memory.get_setting("judge_threshold", 0.90), default=0.90)
+    judge_intent = _infer_intent(request, capabilities)
+    local_judge_stats = memory.get_local_judge_stats()
+    learned_confidence = _get_learned_confidence(local_judge_stats, judge_intent, LOCAL_JUDGE_PROVIDER)
+
     head = _git_head(repo_root)
     determinism_key = f"{head}\n{request.strip()}"
 
@@ -386,7 +623,7 @@ def run_dev_request(
 
     # Prefer *_dev providers when available
     decision.author_providers = _prefer_dev_providers(decision.author_providers, provider_map)
-    decision.judge_provider = _best_available_judge(decision.judge_provider, provider_map)
+    api_judge_provider = _best_available_api_judge(decision.judge_provider, provider_map)
 
     # Ensure we have authors
     if not decision.author_providers:
@@ -449,66 +686,139 @@ def run_dev_request(
     # ----------------------------
     # 2) Judge chooses best patch
     # ----------------------------
-    print(f"[2/4] Judge ({decision.judge_provider}) selecting best patch from {len(successful_patches)} candidate(s)...")
-    
+    print(f"[2/4] Judge ({api_judge_provider}) selecting best patch from {len(successful_patches)} candidate(s)...")
+
     judge_rationale = ""
     chosen_patch = ""
     judge_ok = False
     judge_raw_output = ""
+    judge_provider_used = ""
+    judge_summary = ""
+    api_patch_index: Optional[int] = None
 
-    judge_client = provider_map.get(decision.judge_provider)
     candidate_patch_texts = [_extract_patch_text(p) for p in successful_patches]
+    api_judge_client = provider_map.get(api_judge_provider) if api_judge_provider else None
+    local_judge_client = provider_map.get(LOCAL_JUDGE_PROVIDER)
 
-    judge_prompt = build_judge_prompt(
+    local_judge_raw = ""
+    local_judge_decision: Dict[str, Any] = {
+        "attempted": False,
+        "valid_json": False,
+        "patch_index": None,
+        "confidence": 0.0,
+        "model_confidence": 0.0,
+        "learned_confidence": learned_confidence,
+        "uncertainty_reasons": [],
+        "rationale": "",
+        "escalated": False,
+        "escalation_reason": "",
+        "risky_paths": False,
+    }
+
+    selected_source = ""
+
+    api_judge_prompt = build_judge_prompt(
         request=request,
         context=context,
         patches=candidate_patch_texts,
     )
 
-    if not judge_client or not successful_patches:
+    if not successful_patches:
         chosen_patch, judge_rationale = _choose_first_valid_patch(successful_patches)
-        if not judge_client:
-            judge_rationale = (
-                f"Judge unavailable: '{decision.judge_provider}' not in provider_map. {judge_rationale}"
-            )
-        else:
-            judge_rationale = f"No successful patches to judge. {judge_rationale}"
-
+        judge_provider_used = api_judge_provider or ""
+        selected_source = "fallback"
+        judge_summary = "Judge: api (reason=no_candidates)"
+    elif judge_mode == "api_only":
+        chosen_patch, judge_rationale, judge_ok, judge_raw_output, api_patch_index = _run_api_judge(
+            judge_client=api_judge_client,
+            judge_prompt=api_judge_prompt,
+            candidate_patch_texts=candidate_patch_texts,
+            successful_patches=successful_patches,
+        )
+        judge_provider_used = api_judge_provider or ""
+        selected_source = "api"
+        judge_summary = "Judge: api (reason=api_only)"
     else:
-        try:
-            judge_output = judge_client.generate(judge_prompt)
-            judge_raw_output = judge_output
-            judge_json = _safe_json_load(judge_output)
+        if local_judge_client:
+            local_judge_decision["attempted"] = True
+            local_prompt = build_local_judge_prompt(
+                request=request,
+                context=context,
+                patches=candidate_patch_texts,
+            )
+            local_judge_raw = local_judge_client.generate(local_prompt)
+            local_eval = _evaluate_local_judge_output(
+                raw_output=local_judge_raw,
+                candidate_patch_texts=candidate_patch_texts,
+                threshold=judge_threshold,
+                learned_confidence=learned_confidence,
+            )
+            local_judge_decision.update(local_eval)
+            local_judge_decision["escalated"] = local_eval.get("escalate", True)
+            local_judge_decision["escalation_reason"] = local_eval.get("escalation_reason", "")
 
-            if judge_json and "patch_index" in judge_json:
-                idx = judge_json.get("patch_index")
-                judge_rationale = str(judge_json.get("rationale", "")).strip()
-
-                if isinstance(idx, int) and 0 <= idx < len(candidate_patch_texts):
-                    candidate = _strip_markdown_fences(candidate_patch_texts[idx].strip())
-                    ok, why = _validate_unified_diff(candidate)
-                    if ok:
-                        chosen_patch = candidate
-                        judge_ok = True
-                    else:
-                        chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
-                        judge_rationale = (
-                            f"Judge selected patch_index={idx} but patch was invalid ({why}). {fallback_reason}"
-                        )
+        if judge_mode == "local_only":
+            judge_provider_used = LOCAL_JUDGE_PROVIDER
+            selected_source = "local"
+            local_judge_decision["escalated"] = False
+            local_judge_decision["escalation_reason"] = ""
+            if local_judge_decision["valid_json"] and isinstance(local_judge_decision["patch_index"], int):
+                idx = local_judge_decision["patch_index"]
+                candidate = _strip_markdown_fences(candidate_patch_texts[idx].strip())
+                ok, why = _validate_unified_diff(candidate)
+                if ok:
+                    chosen_patch = candidate
+                    judge_ok = True
+                    judge_rationale = local_judge_decision.get("rationale", "")
                 else:
                     chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
-                    judge_rationale = f"Judge returned invalid patch_index={idx}. {fallback_reason}"
+                    judge_rationale = f"Local judge picked invalid patch ({why}). {fallback_reason}"
+                    selected_source = "fallback"
             else:
                 chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
-                judge_rationale = (
-                    "Judge did not return strict JSON with patch_index; ignored raw judge output. "
-                    f"{fallback_reason}\nRaw judge output:\n{judge_output.strip()}"
+                judge_rationale = f"Local judge invalid output. {fallback_reason}"
+                selected_source = "fallback"
+
+            judge_summary = (
+                f"Judge: local (confidence={local_judge_decision['confidence']:.2f}, "
+                f"threshold={judge_threshold:.2f}, escalated=no)"
+            )
+        else:
+            if not local_judge_client:
+                local_judge_decision["escalated"] = True
+                local_judge_decision["escalation_reason"] = "local_unavailable"
+
+            if local_judge_decision["escalated"]:
+                chosen_patch, judge_rationale, judge_ok, judge_raw_output, api_patch_index = _run_api_judge(
+                    judge_client=api_judge_client,
+                    judge_prompt=api_judge_prompt,
+                    candidate_patch_texts=candidate_patch_texts,
+                    successful_patches=successful_patches,
+                )
+                judge_provider_used = api_judge_provider or ""
+                selected_source = "api"
+                reason = local_judge_decision.get("escalation_reason") or "uncertain"
+                judge_summary = f"Judge: local->api (reason={reason})"
+            else:
+                idx = local_judge_decision["patch_index"]
+                candidate = _strip_markdown_fences(candidate_patch_texts[idx].strip())
+                ok, why = _validate_unified_diff(candidate)
+                if ok:
+                    chosen_patch = candidate
+                    judge_ok = True
+                    judge_rationale = local_judge_decision.get("rationale", "")
+                else:
+                    chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
+                    judge_rationale = f"Local judge picked invalid patch ({why}). {fallback_reason}"
+                    selected_source = "fallback"
+                judge_provider_used = LOCAL_JUDGE_PROVIDER
+                selected_source = "local"
+                judge_summary = (
+                    f"Judge: local (confidence={local_judge_decision['confidence']:.2f}, "
+                    f"threshold={judge_threshold:.2f}, escalated=no)"
                 )
 
-        except Exception as e:
-            chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
-            judge_rationale = f"Judge failed: {e}. {fallback_reason}"
-
+    print(judge_summary)
     print(f"[3/4] Patch selected. Validation: {'OK' if judge_ok else 'fallback'}.")
     
     report: Dict[str, Any] = {
@@ -517,15 +827,41 @@ def run_dev_request(
         "policy": {
             "mode": decision.mode,
             "authors": decision.author_providers,
-            "judge": decision.judge_provider,
+            "judge": api_judge_provider,
             "reason": decision.reason,
         },
         "authors": author_outputs,
         "judge": {
-            "provider": decision.judge_provider,
+            "provider": judge_provider_used,
             "success": judge_ok,
             "rationale": judge_rationale,
             "raw_output": judge_raw_output.strip() if judge_raw_output else "",
+        },
+        "local_judge": {
+            "mode": judge_mode,
+            "intent": judge_intent,
+            "threshold": judge_threshold,
+            "local_provider": LOCAL_JUDGE_PROVIDER,
+            "api_provider": api_judge_provider,
+            "summary": judge_summary,
+            "selected_source": selected_source,
+            "local": {
+                "attempted": local_judge_decision.get("attempted", False),
+                "valid_json": local_judge_decision.get("valid_json", False),
+                "patch_index": local_judge_decision.get("patch_index"),
+                "confidence": local_judge_decision.get("confidence", 0.0),
+                "model_confidence": local_judge_decision.get("model_confidence", 0.0),
+                "learned_confidence": local_judge_decision.get("learned_confidence", learned_confidence),
+                "uncertainty_reasons": local_judge_decision.get("uncertainty_reasons", []),
+                "rationale": local_judge_decision.get("rationale", ""),
+                "raw_output": local_judge_raw.strip() if local_judge_raw else "",
+                "escalated": local_judge_decision.get("escalated", False),
+                "escalation_reason": local_judge_decision.get("escalation_reason", ""),
+                "risky_paths": local_judge_decision.get("risky_paths", False),
+            },
+            "api": {
+                "patch_index": api_patch_index,
+            },
         },
         "chosen_patch": chosen_patch,
         "apply": {
