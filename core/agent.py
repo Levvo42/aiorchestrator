@@ -44,7 +44,7 @@ from core.general_routing import (
 # Local tools
 from tools.local_exec import read_file, write_file, list_dir
 from tools.web_search import web_search
-from tools.web_search_google import web_search_google
+from tools.web_search_google import web_search_google_status
 
 # Provider clients (safe to import; actual instantiation happens in __init__)
 from providers.openai_client import OpenAIClient
@@ -216,6 +216,13 @@ class Agent:
 
         evaluation = self._evaluate(route, execution, final_answer)
 
+        if routing_info and routing_info.get("providers_used"):
+            route = RouteDecision(
+                strategy=route.strategy,
+                providers=routing_info["providers_used"],
+                reason=route.reason,
+            )
+
         run_record = {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "task": task,
@@ -364,6 +371,8 @@ class Agent:
         used_api = False
         local_only_answer = False
 
+        providers_used = ["ollama_local"]
+
         if route == "local":
             final_answer = assessment.get("final_answer", "")
             if general_mode == "local_only":
@@ -375,21 +384,58 @@ class Agent:
                     )
             local_only_answer = True
             execution["llm"].append({"provider": "ollama_local", "success": True, "text": final_answer})
-            routing_info = {"route": "local", "confidence": confidence, "reason": reason}
+            routing_info = {
+                "route": "local",
+                "confidence": confidence,
+                "reason": reason,
+                "providers_used": providers_used,
+            }
             print(f"Route: local (conf={confidence:.2f})")
         elif route == "web":
             used_web = True
-            results = web_search_google(query, num_results=3)
+            results, status, reason_detail = web_search_google_status(query, num_results=3)
             search_tool = "google_cse"
-            if not results:
+            providers_used.append(f"web_search_{search_tool}")
+            execution["local"].append(
+                {
+                    "tool": f"web_search_{search_tool}",
+                    "args": {"query": query},
+                    "success": status == "ok",
+                    "output": results,
+                    "error": "" if status == "ok" else reason_detail,
+                }
+            )
+            if status == "ok":
+                print(f"WebSearch: google_cse query=\"{query}\" results={len(results)}")
+            elif status == "empty":
+                print("WebSearch: google_cse EMPTY")
+            else:
+                print(f"WebSearch: google_cse FAILED reason=\"{reason_detail}\"")
+
+            if status != "ok":
                 results = web_search(query, max_results=3)
-                search_tool = "fallback"
+                search_tool = "duckduckgo"
+                providers_used[-1] = f"web_search_{search_tool}"
+                execution["local"].append(
+                    {
+                        "tool": f"web_search_{search_tool}",
+                        "args": {"query": query},
+                        "success": bool(results),
+                        "output": results,
+                        "error": "" if results else "empty",
+                    }
+                )
+                if results:
+                    print(f"WebSearch: duckduckgo query=\"{query}\" results={len(results)}")
+                else:
+                    print("WebSearch: duckduckgo EMPTY")
             evidence = summarize_evidence(results)
             web_weak = len(results) < 1
             if web_weak:
                 api_provider = self._best_available_api_provider()
                 if api_provider:
                     used_api = True
+                    providers_used.append(api_provider)
                     api_prompt = (
                         "You are a reliable assistant. Use the web evidence below to answer the task.\n"
                         "If evidence is weak or conflicting, state uncertainty.\n\n"
@@ -401,12 +447,15 @@ class Agent:
                     final_answer = text
                     print(f"Route: local->web->api (conf={confidence:.2f})")
                 else:
-                    final_answer = assessment.get("final_answer", "")
+                    final_answer = "Web search returned no results and no API provider is available."
                     print(f"Route: local->web ({search_tool})")
             else:
                 synth_prompt = build_local_evidence_prompt(task, evidence)
                 final_answer = local_client.generate(synth_prompt)
                 execution["llm"].append({"provider": "ollama_local", "success": True, "text": final_answer})
+                if not any(r.get("url") and r.get("url") in final_answer for r in results):
+                    if results and results[0].get("url"):
+                        final_answer = f"{final_answer}\n\nSource: {results[0]['url']}"
                 print(f"Route: local->web ({search_tool})")
 
             routing_info = {
@@ -415,23 +464,40 @@ class Agent:
                 "reason": reason,
                 "query": query,
                 "search_tool": search_tool,
+                "providers_used": providers_used,
             }
         elif route == "api":
             api_provider = self._best_available_api_provider()
             if api_provider:
                 used_api = True
+                providers_used.append(api_provider)
                 api_prompt = f"Task:\n{task}\n\nBe direct and practical."
                 text = self.provider_map[api_provider].generate(api_prompt)
                 execution["llm"].append({"provider": api_provider, "success": True, "text": text})
                 final_answer = text
                 print(f"Route: local->api (conf={confidence:.2f})")
-                routing_info = {"route": "local->api", "confidence": confidence, "reason": reason}
+                routing_info = {
+                    "route": "local->api",
+                    "confidence": confidence,
+                    "reason": reason,
+                    "providers_used": providers_used,
+                }
             else:
                 final_answer = assessment.get("final_answer", "")
-                routing_info = {"route": "local", "confidence": confidence, "reason": "api_unavailable"}
+                routing_info = {
+                    "route": "local",
+                    "confidence": confidence,
+                    "reason": "api_unavailable",
+                    "providers_used": providers_used,
+                }
         else:
             final_answer = assessment.get("final_answer", "")
-            routing_info = {"route": "local", "confidence": confidence, "reason": reason}
+            routing_info = {
+                "route": "local",
+                "confidence": confidence,
+                "reason": reason,
+                "providers_used": providers_used,
+            }
 
         if invalid_json and general_mode == "local_only":
             final_answer = (

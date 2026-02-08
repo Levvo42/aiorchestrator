@@ -159,7 +159,7 @@ class GeneralRoutingTests(unittest.TestCase):
             api = StubProvider("API answer")
             agent.provider_map = {"ollama_local": local, "openai_dev": api}
 
-            with patch("core.agent.web_search_google", return_value=[{"title": "t", "snippet": "s", "url": "u"}]):
+            with patch("core.agent.web_search_google_status", return_value=([{"title": "t", "snippet": "s", "url": "u"}], "ok", "")):
                 with patch("core.agent.web_search", return_value=[]):
                     run = agent.run("When was the digital clock invented?")
 
@@ -204,13 +204,100 @@ class GeneralRoutingTests(unittest.TestCase):
             api = StubProvider(["API answer"])
             agent.provider_map = {"ollama_local": local, "openai_dev": api}
 
-            with patch("core.agent.web_search_google", return_value=[{"title": "t", "snippet": "s", "url": "u"}]):
+            with patch("core.agent.web_search_google_status", return_value=([{"title": "t", "snippet": "s", "url": "u"}], "ok", "")):
                 with patch("core.agent.web_search", return_value=[]):
                     run = agent.run("When was the digital clock invented?")
 
             self.assertEqual(run["routing"]["route"], "local->web")
             self.assertEqual(run["routing"]["search_tool"], "google_cse")
             self.assertEqual(len(api.calls), 0)
+
+    def test_weather_query_uses_web(self) -> None:
+        class StubProvider:
+            def __init__(self, responses: list[str]) -> None:
+                self.responses = responses
+                self.calls = []
+
+            def generate(self, prompt: str) -> str:
+                self.calls.append(prompt)
+                return self.responses.pop(0)
+
+        capabilities = {
+            "providers": {
+                "ollama_local": {"enabled": True},
+                "openai_dev": {"enabled": True},
+            },
+            "routing_rules": {},
+            "judge": {"task_intent_keywords": {}},
+            "dev": {},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = MemoryStore(
+                state_path=str(Path(tmp) / "state.local.json"),
+                seed_path=str(Path(tmp) / "state.json"),
+            )
+            memory.set_setting("general_mode", "auto")
+
+            agent = Agent(capabilities=capabilities, memory=memory)
+            local = StubProvider([
+                '{"final_answer": "Not sure", "confidence": 0.2, "escalate_to": "none", '
+                '"search_query": "weather Duved Sweden", "uncertainty_reasons": [], '
+                '"suggested_search_query": ""}',
+                "Weather details with Source: http://example.com",
+            ])
+            api = StubProvider(["API answer"])
+            agent.provider_map = {"ollama_local": local, "openai_dev": api}
+
+            with patch("core.agent.web_search_google_status", return_value=([{"title": "t", "snippet": "s", "url": "u"}], "ok", "")):
+                with patch("core.agent.web_search", return_value=[]):
+                    run = agent.run("How's the weather in Duved, Sweden?")
+
+            self.assertEqual(run["routing"]["route"], "local->web")
+            self.assertEqual(len(api.calls), 0)
+
+    def test_web_error_escalates_to_api(self) -> None:
+        class StubProvider:
+            def __init__(self, response: str) -> None:
+                self.response = response
+                self.calls = []
+
+            def generate(self, prompt: str) -> str:
+                self.calls.append(prompt)
+                return self.response
+
+        capabilities = {
+            "providers": {
+                "ollama_local": {"enabled": True},
+                "openai_dev": {"enabled": True},
+            },
+            "routing_rules": {},
+            "judge": {"task_intent_keywords": {}},
+            "dev": {},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = MemoryStore(
+                state_path=str(Path(tmp) / "state.local.json"),
+                seed_path=str(Path(tmp) / "state.json"),
+            )
+            memory.set_setting("general_mode", "auto")
+
+            agent = Agent(capabilities=capabilities, memory=memory)
+            local = StubProvider(
+                '{"final_answer": "Not sure", "confidence": 0.2, "escalate_to": "web", '
+                '"search_query": "weather Duved Sweden", "uncertainty_reasons": [], '
+                '"suggested_search_query": ""}'
+            )
+            api = StubProvider("API answer")
+            agent.provider_map = {"ollama_local": local, "openai_dev": api}
+
+            with patch("core.agent.web_search_google_status", return_value=([], "error", "boom")):
+                with patch("core.agent.web_search", return_value=[]):
+                    run = agent.run("How's the weather in Duved, Sweden?")
+
+            self.assertEqual(run["routing"]["route"], "local->web->api")
+            self.assertGreater(len(api.calls), 0)
 
 
 if __name__ == "__main__":
