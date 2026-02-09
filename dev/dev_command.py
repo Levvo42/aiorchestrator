@@ -262,9 +262,9 @@ def _run_api_judge(
     if not judge_client or not successful_patches:
         chosen_patch, judge_rationale = _choose_first_valid_patch(successful_patches)
         if not judge_client:
-            judge_rationale = f"Judge unavailable. {judge_rationale}"
+            judge_rationale = f"Judge unavailable; {judge_rationale}"
         else:
-            judge_rationale = f"No successful patches to judge. {judge_rationale}"
+            judge_rationale = f"No successful patches; {judge_rationale}"
         return chosen_patch, judge_rationale, judge_ok, judge_raw_output, api_patch_index
 
     try:
@@ -286,21 +286,21 @@ def _run_api_judge(
                 else:
                     chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
                     judge_rationale = (
-                        f"Judge selected patch_index={idx} but patch was invalid ({why}). {fallback_reason}"
+                        f"Judge selected patch_index={idx}, but patch invalid ({why}). {fallback_reason}"
                     )
             else:
                 chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
-                judge_rationale = f"Judge returned invalid patch_index={idx}. {fallback_reason}"
+                judge_rationale = f"Judge returned invalid patch_index={idx}; {fallback_reason}"
         else:
             chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
             judge_rationale = (
-                "Judge did not return strict JSON with patch_index; ignored raw judge output. "
+                "Judge output invalid JSON; ignored. "
                 f"{fallback_reason}\nRaw judge output:\n{judge_output.strip()}"
             )
 
     except Exception as e:
         chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
-        judge_rationale = f"Judge failed: {e}. {fallback_reason}"
+        judge_rationale = f"Judge error: {e}. {fallback_reason}"
 
     return chosen_patch, judge_rationale, judge_ok, judge_raw_output, api_patch_index
 
@@ -318,7 +318,7 @@ def _validate_unified_diff(diff_text: str) -> Tuple[bool, str]:
     """
     t = (diff_text or "").strip()
     if not t:
-        return False, "Empty patch."
+        return False, "Patch is empty."
 
     lines = t.splitlines()
 
@@ -331,7 +331,7 @@ def _validate_unified_diff(diff_text: str) -> Tuple[bool, str]:
     if first_diff_idx is None:
         return False, "Patch missing 'diff --git' header."
     if first_diff_idx > 0:
-        return False, f"Patch has {first_diff_idx} lines of garbage before first 'diff --git' header."
+        return False, f"Patch has {first_diff_idx} leading lines before the first 'diff --git' header."
 
     i = 0
     blocks = 0
@@ -452,7 +452,7 @@ def _check_patch_applies(repo_root: str, diff_text: str) -> Tuple[bool, str]:
         return False, str(e)
     if completed.returncode != 0:
         msg = (completed.stderr or completed.stdout or "").strip()
-        return False, msg or "Patch does not apply cleanly."
+        return False, msg or "Patch does not apply cleanly; check context."
     return True, "OK"
 
 def _extract_changed_files(diff_text: str) -> List[str]:
@@ -484,8 +484,8 @@ def _choose_first_valid_patch(successful_patches: List[Any]) -> Tuple[str, str]:
         patch_text = _strip_markdown_fences(_extract_patch_text(item))
         ok, _ = _validate_unified_diff(patch_text)
         if ok:
-            return patch_text, "Fallback: selected first structurally valid unified diff."
-    return "", "Fallback: no candidate patch was a structurally valid unified diff."
+            return patch_text, "Fallback: selected first valid unified diff."
+    return "", "Fallback: no candidate patch was a valid unified diff."
 
 
 # ----------------------------
@@ -634,8 +634,8 @@ def run_dev_request(
     # ----------------------------
     # 1) Generate candidate patches
     # ----------------------------
-    print(f"[1/4] Generating patches from {len(decision.author_providers)} author(s)...")
-    
+    print(f"[1/4] Generate patches: {len(decision.author_providers)} author(s)")
+
     author_outputs: List[Dict[str, Any]] = []
     author_prompt = build_author_prompt(request=request, context=context)
 
@@ -646,7 +646,7 @@ def run_dev_request(
                 {
                     "provider": provider_name,
                     "success": False,
-                    "error": f"Provider '{provider_name}' not found. Available: {list(provider_map.keys())}",
+                    "error": f"Provider '{provider_name}' not available. Configured: {list(provider_map.keys())}",
                 }
             )
             continue
@@ -686,7 +686,7 @@ def run_dev_request(
     # ----------------------------
     # 2) Judge chooses best patch
     # ----------------------------
-    print(f"[2/4] Judge ({api_judge_provider}) selecting best patch from {len(successful_patches)} candidate(s)...")
+    print(f"[2/4] Judge ({api_judge_provider}): select from {len(successful_patches)} candidate(s)")
 
     judge_rationale = ""
     chosen_patch = ""
@@ -727,7 +727,7 @@ def run_dev_request(
         chosen_patch, judge_rationale = _choose_first_valid_patch(successful_patches)
         judge_provider_used = api_judge_provider or ""
         selected_source = "fallback"
-        judge_summary = "Judge: api (reason=no_candidates)"
+        judge_summary = "Judge: api reason=no_candidates"
     elif judge_mode == "api_only":
         chosen_patch, judge_rationale, judge_ok, judge_raw_output, api_patch_index = _run_api_judge(
             judge_client=api_judge_client,
@@ -737,7 +737,7 @@ def run_dev_request(
         )
         judge_provider_used = api_judge_provider or ""
         selected_source = "api"
-        judge_summary = "Judge: api (reason=api_only)"
+        judge_summary = "Judge: api reason=api_only"
     else:
         if local_judge_client:
             local_judge_decision["attempted"] = True
@@ -772,16 +772,16 @@ def run_dev_request(
                     judge_rationale = local_judge_decision.get("rationale", "")
                 else:
                     chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
-                    judge_rationale = f"Local judge picked invalid patch ({why}). {fallback_reason}"
+                    judge_rationale = f"Local judge selected invalid patch ({why}). {fallback_reason}"
                     selected_source = "fallback"
             else:
                 chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
-                judge_rationale = f"Local judge invalid output. {fallback_reason}"
+                judge_rationale = f"Local judge output invalid JSON. {fallback_reason}"
                 selected_source = "fallback"
 
             judge_summary = (
-                f"Judge: local (confidence={local_judge_decision['confidence']:.2f}, "
-                f"threshold={judge_threshold:.2f}, escalated=no)"
+                f"Judge: local confidence={local_judge_decision['confidence']:.2f} "
+                f"threshold={judge_threshold:.2f} escalated=no"
             )
         else:
             if not local_judge_client:
@@ -798,7 +798,7 @@ def run_dev_request(
                 judge_provider_used = api_judge_provider or ""
                 selected_source = "api"
                 reason = local_judge_decision.get("escalation_reason") or "uncertain"
-                judge_summary = f"Judge: local->api (reason={reason})"
+                judge_summary = f"Judge: local->api reason={reason}"
             else:
                 idx = local_judge_decision["patch_index"]
                 candidate = _strip_markdown_fences(candidate_patch_texts[idx].strip())
@@ -809,18 +809,18 @@ def run_dev_request(
                     judge_rationale = local_judge_decision.get("rationale", "")
                 else:
                     chosen_patch, fallback_reason = _choose_first_valid_patch(successful_patches)
-                    judge_rationale = f"Local judge picked invalid patch ({why}). {fallback_reason}"
+                    judge_rationale = f"Local judge selected invalid patch ({why}). {fallback_reason}"
                     selected_source = "fallback"
                 judge_provider_used = LOCAL_JUDGE_PROVIDER
                 selected_source = "local"
                 judge_summary = (
-                    f"Judge: local (confidence={local_judge_decision['confidence']:.2f}, "
-                    f"threshold={judge_threshold:.2f}, escalated=no)"
+                    f"Judge: local confidence={local_judge_decision['confidence']:.2f} "
+                    f"threshold={judge_threshold:.2f} escalated=no"
                 )
 
     print(judge_summary)
-    print(f"[3/4] Patch selected. Validation: {'OK' if judge_ok else 'fallback'}.")
-    
+    print(f"[3/4] Patch selected. Validation: {'OK' if judge_ok else 'fallback'}")
+
     report: Dict[str, Any] = {
         "request": request,
         "context": context,
@@ -978,7 +978,7 @@ def run_dev_fix_request(
 
 
 def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
-    print("[Apply] Starting patch application...")
+    print("[Apply] Start")
     
     patch = (report.get("chosen_patch") or "").strip()
     patch = _strip_markdown_fences(patch)
@@ -1000,19 +1000,19 @@ def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
     if not patch:
         report["apply"]["attempted"] = True
         report["apply"]["applied"] = False
-        report["apply"]["error"] = "No patch available to apply."
+        report["apply"]["error"] = "No patch to apply."
         return report
 
     ok, why = _validate_unified_diff(patch)
     if not ok:
         report["apply"]["attempted"] = True
         report["apply"]["applied"] = False
-        report["apply"]["error"] = f"Chosen patch invalid: {why}"
+        report["apply"]["error"] = f"Selected patch invalid: {why}"
         return report
 
     report["apply"]["attempted"] = True
 
-    print("[Apply] Applying patch to working tree...")
+    print("[Apply] Applying patch")
     
     try:
         changed_files = _extract_changed_files(patch)
@@ -1023,7 +1023,7 @@ def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
         report["apply"]["changed_files"] = changed_files
         report["apply"]["applied"] = True
 
-        print(f"[Apply] Patch applied. Validating {len([p for p in changed_files if p.endswith('.py')])} Python file(s)...")
+        print(f"[Apply] Applied. Validating {len([p for p in changed_files if p.endswith('.py')])} Python file(s)")
         
         python_files = [p for p in changed_files if p.endswith(".py")]
         if python_files:
@@ -1034,7 +1034,7 @@ def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
         if compile_ok:
             tests_ok, tests_out, tests_ran = run_tests_if_available(repo_root=repo_root)
         else:
-            tests_ok, tests_out, tests_ran = True, "Skipped tests because py_compile failed.", False
+            tests_ok, tests_out, tests_ran = True, "Tests skipped; py_compile failed.", False
 
         # If validation fails, rollback
         report["apply"]["tests_ran"] = tests_ran
@@ -1050,7 +1050,7 @@ def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
         ).strip()
 
         if not report["apply"]["validation_ok"]:
-            print("[Apply] Validation failed. Rolling back changes...")
+            print("[Apply] Validation failed; rolling back")
             
             # Rollback: restore files from backups
             rollback_errors = []
@@ -1076,7 +1076,7 @@ def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
 
             report["apply"]["applied"] = False
             error_msg = (
-                "Validation failed after apply. Files have been restored from backups.\n"
+                "Validation failed after apply. Backups restored.\n"
                 f"Validation output:\n{report['apply']['validation_output']}"
             )
             if rollback_errors:
@@ -1084,7 +1084,7 @@ def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
 
             report["apply"]["error"] = error_msg
 
-        print(f"[Apply] Complete. Validation: {'OK' if report['apply']['validation_ok'] else 'FAILED'}.")
+        print(f"[Apply] Complete. Validation: {'OK' if report['apply']['validation_ok'] else 'FAILED'}")
         
         return report
 

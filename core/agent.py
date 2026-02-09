@@ -44,7 +44,7 @@ from core.general_routing import (
 
 # Local tools
 from tools.local_exec import read_file, write_file, list_dir
-from tools.web_search import web_search
+from tools.web_search_open_web import web_search_open_web_status
 from tools.web_search_vertex import web_search_vertex_status
 
 # Provider clients (safe to import; actual instantiation happens in __init__)
@@ -53,9 +53,6 @@ from providers.openai_responses_client import OpenAIResponsesClient
 from providers.claude_client import ClaudeClient
 from providers.ollama_client import OllamaClient
 
-# If you have a Gemini client, import it here.
-# If you DON'T have it, keep it commented out to avoid import errors.
-# from providers.gemini_client import GeminiClient
 
 
 class Agent:
@@ -149,14 +146,6 @@ class Agent:
                 base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
                 model=os.getenv("OLLAMA_MODEL", "gpt-oss:20b"),
             )
-
-        # ----------------------------
-        # Gemini (optional)
-        # ----------------------------
-        # if self._provider_enabled_in_capabilities("gemini") and os.getenv("GOOGLE_API_KEY"):
-        #     provider_map["gemini"] = GeminiClient(
-        #         model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-        #     )
 
         return provider_map
 
@@ -267,8 +256,8 @@ class Agent:
                         "provider": provider_name,
                         "success": False,
                         "error": (
-                            f"Provider '{provider_name}' not found in provider_map. "
-                            f"Available: {list(self.provider_map.keys())}"
+                            f"Provider '{provider_name}' not available. "
+                            f"Configured: {list(self.provider_map.keys())}"
                         ),
                     }
                 )
@@ -324,7 +313,7 @@ class Agent:
                 execution["llm"].append({"provider": api_provider, "success": True, "text": text})
                 routing_info = {"route": "api", "reason": "local_unavailable", "confidence": 0.0}
                 return execution, text, routing_info
-            return execution, "Local model unavailable and no API providers available.", {
+            return execution, "No local model or API providers available.", {
                 "route": "none",
                 "reason": "no_providers",
                 "confidence": 0.0,
@@ -381,7 +370,7 @@ class Agent:
                 if uncertainty or confidence < threshold:
                     final_answer = (
                         f"{final_answer}\n\n"
-                        "Note: Uncertain response from local model."
+                        "Note: Local response is uncertain."
                     )
             local_only_answer = True
             execution["llm"].append({"provider": "ollama_local", "success": True, "text": final_answer})
@@ -391,7 +380,7 @@ class Agent:
                 "reason": reason,
                 "providers_used": providers_used,
             }
-            print(f"Route: local (conf={confidence:.2f})")
+            print(f"Route local conf={confidence:.2f}")
         elif route == "web":
             used_web = True
             authoritative = is_authoritative_query(task)
@@ -409,11 +398,11 @@ class Agent:
 
             def _log_search(tool_name: str, tool_status: str, detail: str, count: int) -> None:
                 if tool_status == "ok":
-                    print(f"WebSearch: {tool_name} query=\"{query}\" results={count}")
+                    print(f"WebSearch {tool_name}: ok query=\"{query}\" results={count}")
                 elif tool_status in ("empty_results", "empty"):
-                    print(f"WebSearch: {tool_name} EMPTY")
+                    print(f"WebSearch {tool_name}: empty")
                 else:
-                    print(f"WebSearch: {tool_name} FAILED reason=\"{detail}\"")
+                    print(f"WebSearch {tool_name}: error detail=\"{detail}\"")
 
             def _record_search(tool_name: str, tool_status: str, items: list[dict], detail: str) -> None:
                 providers_used.append(f"web_search_{tool_name}")
@@ -433,19 +422,17 @@ class Agent:
                 _record_search(search_tool, status, results, reason_detail)
                 _log_search("vertex_search", status, reason_detail, len(results))
                 if status != "ok" or _low_quality(results):
-                    open_results = web_search(query, max_results=3)
-                    open_status = "ok" if open_results else "empty_results"
-                    _record_search("open_web", open_status, open_results, "empty_results")
-                    _log_search("open_web", open_status, "empty_results", len(open_results))
-                    if open_results:
+                    open_results, open_status, open_detail = web_search_open_web_status(query, num_results=3)
+                    _record_search("open_web", open_status, open_results, open_detail)
+                    _log_search("open_web", open_status, open_detail, len(open_results))
+                    if open_status == "ok":
                         results = open_results
                         status = "ok"
                         search_tool = "open_web"
             else:
-                open_results = web_search(query, max_results=3)
-                open_status = "ok" if open_results else "empty_results"
-                _record_search("open_web", open_status, open_results, "empty_results")
-                _log_search("open_web", open_status, "empty_results", len(open_results))
+                open_results, open_status, open_detail = web_search_open_web_status(query, num_results=3)
+                _record_search("open_web", open_status, open_results, open_detail)
+                _log_search("open_web", open_status, open_detail, len(open_results))
                 results = open_results
                 status = open_status
                 search_tool = "open_web"
@@ -466,18 +453,19 @@ class Agent:
                     used_api = True
                     providers_used.append(api_provider)
                     api_prompt = (
-                        "You are a reliable assistant. Use the web evidence below to answer the task.\n"
-                        "If evidence is weak or conflicting, state uncertainty.\n\n"
+                        "Role: assistant.\n"
+                        "Use the web evidence to answer the task.\n"
+                        "If evidence is weak or conflicting, say so.\n\n"
                         f"Task:\n{task}\n\n"
                         f"Web evidence:\n{evidence}\n"
                     )
                     text = self.provider_map[api_provider].generate(api_prompt)
                     execution["llm"].append({"provider": api_provider, "success": True, "text": text})
                     final_answer = text
-                    print(f"Route: local->web->api (conf={confidence:.2f})")
+                    print(f"Route local->web->api conf={confidence:.2f}")
                 else:
-                    final_answer = "Web search returned no results and no API provider is available."
-                    print(f"Route: local->web ({search_tool})")
+                    final_answer = "Web search returned no results; no API provider available."
+                    print(f"Route local->web tool={search_tool}")
             else:
                 synth_prompt = build_local_evidence_prompt(task, evidence)
                 final_answer = local_client.generate(synth_prompt)
@@ -485,7 +473,7 @@ class Agent:
                 if not any(r.get("url") and r.get("url") in final_answer for r in results):
                     if results and results[0].get("url"):
                         final_answer = f"{final_answer}\n\nSource: {results[0]['url']}"
-                print(f"Route: local->web ({search_tool})")
+                print(f"Route local->web tool={search_tool}")
 
             routing_info = {
                 "route": "local->web->api" if used_api else "local->web",
@@ -504,7 +492,7 @@ class Agent:
                 text = self.provider_map[api_provider].generate(api_prompt)
                 execution["llm"].append({"provider": api_provider, "success": True, "text": text})
                 final_answer = text
-                print(f"Route: local->api (conf={confidence:.2f})")
+                print(f"Route local->api conf={confidence:.2f}")
                 routing_info = {
                     "route": "local->api",
                     "confidence": confidence,
@@ -531,7 +519,7 @@ class Agent:
         if invalid_json and general_mode == "local_only":
             final_answer = (
                 f"{assessment.get('final_answer', '')}\n\n"
-                "Note: Local model did not provide structured confidence; treat this as uncertain."
+                "Note: Local response lacks structured confidence; treat as uncertain."
             )
 
         self.memory.update_general_routing_stats(
@@ -565,7 +553,7 @@ class Agent:
                 write_file(path, content)
                 return {"tool": tool, "args": args, "success": True, "output": f"Wrote {len(content)} chars."}
 
-            return {"tool": tool, "args": args, "success": False, "error": "Unknown tool name."}
+            return {"tool": tool, "args": args, "success": False, "error": "Unknown tool."}
 
         except Exception as e:
             return {"tool": tool, "args": args, "success": False, "error": str(e)}
@@ -576,4 +564,4 @@ class Agent:
             return {"success": ok, "notes": "Local tool execution success check."}
 
         ok = final_answer is not None and isinstance(final_answer, str) and len(final_answer.strip()) > 0
-        return {"success": ok, "notes": "Judge produced a final answer."}
+        return {"success": ok, "notes": "Final answer produced by judge."}

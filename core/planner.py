@@ -80,13 +80,13 @@ class Planner:
         Keep it simple and consistent in v0.
         """
         return (
-            "You are part of a self-hosted AI orchestrator.\n"
+            "Role: worker model.\n"
             "Task:\n"
             f"{task}\n\n"
-            "Return output in two sections:\n"
-            "1) PLAN: 3-7 bullet points\n"
-            "2) ANSWER: the final response\n"
-            "Be concise and practical.\n"
+            "Return two sections:\n"
+            "PLAN: 3-7 bullet points\n"
+            "ANSWER: final response\n"
+            "Keep it concise and practical.\n"
         )
 
     def _infer_local_actions(self, task: str) -> List[Dict[str, Any]]:

@@ -30,9 +30,7 @@ def require_env_var(name: str) -> str:
     _ensure_dotenv_loaded()
     value = os.environ.get(name)
     if value is None or str(value).strip() == "":
-        raise RuntimeError(
-            f"Required env var {name} missing or unavailable — please set it in .env or shell."
-        )
+        raise RuntimeError(f"Required env var {name} missing or empty. Set it in .env or shell.")
     return value
 
 

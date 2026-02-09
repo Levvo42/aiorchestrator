@@ -83,15 +83,15 @@ def is_authoritative_query(task: str) -> bool:
 
 def build_local_assessment_prompt(task: str, threshold: float) -> str:
     return (
-        "System: You are a local model. You must respond ONLY with valid JSON.\n"
-        "System: Provide a direct answer plus a strict self-assessment.\n"
-        "System: Return ONLY JSON. No other text.\n"
-        "System: For greetings/smalltalk, set confidence to 1.0 and escalate_to=\"none\".\n"
-        f"System: If uncertain, set confidence < {threshold:.2f} and explain why.\n"
-        f"System: If the question is factual/time-sensitive and confidence < {threshold:.2f},\n"
-        "System: set escalate_to=\"web\" and provide search_query.\n"
-        "System: Do not include any text outside JSON.\n\n"
-        "JSON schema:\n"
+        "System: Role: local model.\n"
+        "System: Output JSON only.\n"
+        "System: Provide a direct answer and a self-assessment.\n"
+        "System: For greetings/smalltalk, set confidence=1.0 and escalate_to=\"none\".\n"
+        f"System: If uncertain, set confidence < {threshold:.2f} and explain in uncertainty_reasons.\n"
+        f"System: If factual or time-sensitive and confidence < {threshold:.2f},\n"
+        "System: set escalate_to=\"web\" and include search_query.\n"
+        "System: No text outside JSON.\n\n"
+        "Schema:\n"
         "{\n"
         '  "final_answer": "string",\n'
         '  "confidence": 0.0,\n'
@@ -212,7 +212,7 @@ def decide_general_route(
 def summarize_evidence(results: List[Dict[str, str]]) -> str:
     if not results:
         return "No web results available."
-    lines: List[str] = ["Top sources:"]
+    lines: List[str] = ["Sources:"]
     for item in results[:3]:
         title = item.get("title", "").strip()
         snippet = item.get("snippet", "").strip()
@@ -223,9 +223,10 @@ def summarize_evidence(results: List[Dict[str, str]]) -> str:
 
 def build_local_evidence_prompt(task: str, evidence: str) -> str:
     return (
-        "You are a local model. Use the evidence to answer the task.\n"
-        "If evidence is insufficient, say so.\n"
-        "Cite sources by URL in the answer.\n\n"
+        "Role: local model.\n"
+        "Use the evidence to answer the task.\n"
+        "If evidence is insufficient, state that.\n"
+        "Cite sources by URL.\n\n"
         f"Task:\n{task}\n\n"
         f"Evidence:\n{evidence}\n"
     )

@@ -159,7 +159,10 @@ class GeneralRoutingTests(unittest.TestCase):
             api = StubProvider("API answer")
             agent.provider_map = {"ollama_local": local, "openai_dev": api}
 
-            with patch("core.agent.web_search", return_value=[{"title": "t", "snippet": "s", "url": "u"}]):
+            with patch(
+                "core.agent.web_search_open_web_status",
+                return_value=([{"title": "t", "snippet": "s", "url": "u"}], "ok", ""),
+            ):
                 with patch("core.agent.web_search_vertex_status", return_value=([], "empty_results", "empty_results")):
                     run = agent.run("When was the digital clock invented?")
 
@@ -204,7 +207,10 @@ class GeneralRoutingTests(unittest.TestCase):
             api = StubProvider(["API answer"])
             agent.provider_map = {"ollama_local": local, "openai_dev": api}
 
-            with patch("core.agent.web_search", return_value=[{"title": "t", "snippet": "s", "url": "u"}]):
+            with patch(
+                "core.agent.web_search_open_web_status",
+                return_value=([{"title": "t", "snippet": "s", "url": "u"}], "ok", ""),
+            ):
                 with patch("core.agent.web_search_vertex_status", return_value=([], "empty_results", "empty_results")):
                     run = agent.run("When was the digital clock invented?")
 
@@ -249,7 +255,10 @@ class GeneralRoutingTests(unittest.TestCase):
             api = StubProvider(["API answer"])
             agent.provider_map = {"ollama_local": local, "openai_dev": api}
 
-            with patch("core.agent.web_search", return_value=[{"title": "t", "snippet": "s", "url": "u"}]):
+            with patch(
+                "core.agent.web_search_open_web_status",
+                return_value=([{"title": "t", "snippet": "s", "url": "u"}], "ok", ""),
+            ):
                 with patch("core.agent.web_search_vertex_status", return_value=([], "empty_results", "empty_results")):
                     run = agent.run("How's the weather in Duved, Sweden?")
 
@@ -292,7 +301,10 @@ class GeneralRoutingTests(unittest.TestCase):
             api = StubProvider("API answer")
             agent.provider_map = {"ollama_local": local, "openai_dev": api}
 
-            with patch("core.agent.web_search", return_value=[]):
+            with patch(
+                "core.agent.web_search_open_web_status",
+                return_value=([], "empty_results", "empty_results"),
+            ):
                 with patch("core.agent.web_search_vertex_status", return_value=([], "error", "boom")):
                     run = agent.run("How's the weather in Duved, Sweden?")
 
@@ -337,7 +349,7 @@ class GeneralRoutingTests(unittest.TestCase):
             agent.provider_map = {"ollama_local": local, "openai_dev": api}
 
             with patch("core.agent.web_search_vertex_status", return_value=([{"title": "t", "snippet": "s", "url": "u"}], "ok", "")) as vertex_mock:
-                with patch("core.agent.web_search", return_value=[]) as open_mock:
+                with patch("core.agent.web_search_open_web_status", return_value=([], "empty_results", "empty_results")) as open_mock:
                     run = agent.run("What are the side effects of ibuprofen?")
 
             self.assertEqual(run["routing"]["search_tool"], "vertex_search")

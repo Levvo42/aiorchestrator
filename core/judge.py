@@ -129,7 +129,7 @@ class JudgeRouter:
             scores[provider_name] = score
 
         # If no provider scored (no keys), fallback to default provider if possible
-        default_provider = self.judge_cfg.get("default_provider", "gemini")
+        default_provider = self.judge_cfg.get("default_provider", "openai")
         if not scores:
             chosen = default_provider if self._provider_is_available(default_provider) else ""
             return JudgeDecision(
@@ -234,8 +234,8 @@ class Judge:
         # If nothing to judge, ask it to answer directly
         if not successful:
             return (
-                "You are the judge model for an AI orchestrator.\n"
-                "No worker outputs were available.\n"
+                "Role: judge.\n"
+                "No worker outputs available.\n"
                 f"Task: {task}\n\n"
                 "Provide the best possible answer."
             )
@@ -246,15 +246,14 @@ class Judge:
             answers_block += f"\n[Answer {i} from {o['provider']}]\n{o['text']}\n"
 
         return (
-            "You are the judge model for an AI orchestrator.\n"
-            "Your job:\n"
-            "- Produce ONE final answer that best satisfies the task.\n"
-            "- If answers conflict, explain briefly which is more reliable and why.\n"
-            "- If answers agree, merge them into a cleaner, stronger response.\n"
-            "- Be practical and avoid fluff.\n\n"
+            "Role: judge.\n"
+            "Return one final answer.\n"
+            "If answers conflict, choose the most reliable and note why briefly.\n"
+            "If answers agree, merge into a clearer response.\n"
+            "Be concise and practical.\n\n"
             f"Task:\n{task}\n\n"
             f"Worker answers:\n{answers_block}\n"
-            "Return ONLY the final answer (no extra sections)."
+            "Return only the final answer."
         )
 
     def _fallback_merge(self, worker_outputs: List[Dict[str, Any]]) -> str:
@@ -265,4 +264,4 @@ class Judge:
         for o in worker_outputs:
             if o.get("success") and o.get("text"):
                 return o["text"]
-        return "No worker outputs were available, and no judge model could be used."
+        return "No worker outputs available and no judge provider configured."

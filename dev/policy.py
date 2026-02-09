@@ -39,7 +39,7 @@ class DevPolicy:
         # Defaults from capabilities.json
         dev_cfg = capabilities.get("dev", {})
         self.default_mode = dev_cfg.get("default_mode", "auto")
-        self.default_judge_provider = dev_cfg.get("default_judge_provider", "gemini")
+        self.default_judge_provider = dev_cfg.get("default_judge_provider", "openai_dev")
         self.default_min_authors = int(dev_cfg.get("min_authors", 2))
         self.default_max_authors = int(dev_cfg.get("max_authors", 3))
         self.default_exploration_rate = float(dev_cfg.get("exploration_rate", 0.25))

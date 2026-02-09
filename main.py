@@ -1,4 +1,3 @@
-# python
 """
 main.py
 -------
@@ -6,22 +5,26 @@ Entry point for your AI Orchestrator.
 
 You can type tasks, or commands like:
 - Set Judge: openai
-- Set Judge: gemini
+- Set Judge: claude
 - Set Judge Mode: auto
 - Set Judge Mode: fixed
 - Show Judge
 """
 from __future__ import annotations
-from dotenv import load_dotenv
-load_dotenv()
-import subprocess
+
 import json
+import subprocess
 from pathlib import Path
 from typing import Optional
+
+from dotenv import load_dotenv
+
 from core.agent import Agent
-from core.memory import MemoryStore
 from core.env import validate_required_env_vars
+from core.memory import MemoryStore
 from dev.dev_command import run_dev_request, run_dev_fix_request, apply_dev_patch
+
+load_dotenv()
 
 
 def load_capabilities(path: str = "core/capabilities.json") -> dict:
@@ -81,14 +84,14 @@ def handle_command(text: str, memory: MemoryStore,
     if t.lower().startswith("set dev mode:"):
         mode = t.split(":", 1)[1].strip().lower()
         if mode not in ("auto", "fixed"):
-            return "Invalid. Use: Set Dev Mode: auto | fixed"
+            return "Invalid dev mode. Use: Set Dev Mode: auto | fixed."
         memory.set_setting("dev_mode", mode)
         return f"Dev mode set to: {mode}"
 
     if t.lower().startswith("set dev judge mode:"):
         mode = t.split(":", 1)[1].strip().lower()
         if mode not in ("auto", "local_only", "api_only"):
-            return "Invalid. Use: Set Dev Judge Mode: auto | local_only | api_only"
+            return "Invalid dev judge mode. Use: Set Dev Judge Mode: auto | local_only | api_only."
         memory.set_setting("dev_judge_mode", mode)
         return f"Dev judge mode set to: {mode}"
 
@@ -108,11 +111,11 @@ def handle_command(text: str, memory: MemoryStore,
         # Extract message after "Dev: Commit with message"
         parts = text.split("\"")
         if len(parts) < 2:
-            return "Usage: Dev: Commit with message \"<your commit message>\""
+            return "Usage: Dev: Commit with message \"<message>\""
 
         commit_msg = parts[1].strip()
         if not commit_msg:
-            return "Commit message cannot be empty."
+            return "Commit message is empty."
 
         # Use last_applied_dev_report (the applied patch) for committing
         if last_applied_dev_report is None:
@@ -137,7 +140,7 @@ def handle_command(text: str, memory: MemoryStore,
 
     if t.lower() == "help":
         return (
-            "Available commands:\n"
+            "Commands:\n"
             "General:\n"
             "  Help\n"
             "  Show Settings\n"
@@ -158,7 +161,7 @@ def handle_command(text: str, memory: MemoryStore,
             "  Set Dev Authors: a, b, c\n"
             "  Dev: Commit with message \"<msg>\"\n"
             "\nExamples:\n"
-            "  Set Judge: gemini\n"
+            "  Set Judge: openai\n"
             "  Set Verbosity: final\n"
             "  Dev: add logging to router\n"
         )
@@ -172,7 +175,7 @@ def handle_command(text: str, memory: MemoryStore,
     if t.lower().startswith("set judge mode:"):
         mode = t.split(":", 1)[1].strip().lower()
         if mode not in ("auto", "fixed", "local_only", "api_only"):
-            return "Invalid judge mode. Use: Set Judge Mode: auto | fixed | local_only | api_only"
+            return "Invalid judge mode. Use: Set Judge Mode: auto | fixed | local_only | api_only."
 
         memory.set_setting("judge_mode", mode)
 
@@ -197,7 +200,7 @@ def handle_command(text: str, memory: MemoryStore,
     if t.lower().startswith("set judge:"):
         provider = normalize_provider_name(t.split(":", 1)[1])
         if not provider:
-            return "Usage: Set Judge: openai  OR  Set Judge: gemini"
+            return "Usage: Set Judge: openai | claude"
 
         memory.set_setting("judge_mode", "fixed")
         memory.set_setting("judge_provider", provider)
@@ -207,7 +210,7 @@ def handle_command(text: str, memory: MemoryStore,
     if t.lower().startswith("judge with "):
         provider = normalize_provider_name(t[len("judge with "):])
         if not provider:
-            return "Usage: Judge with openai  OR  Judge with gemini"
+            return "Usage: Judge with openai | claude"
 
         memory.set_setting("judge_mode", "fixed")
         memory.set_setting("judge_provider", provider)
@@ -224,7 +227,7 @@ def handle_command(text: str, memory: MemoryStore,
     if t.lower().startswith("set general mode:"):
         mode = t.split(":", 1)[1].strip().lower()
         if mode not in ("auto", "local_only", "api_only"):
-            return "Invalid general mode. Use: Set General Mode: auto | local_only | api_only"
+            return "Invalid general mode. Use: Set General Mode: auto | local_only | api_only."
         memory.set_setting("general_mode", mode)
         return f"General mode set to: {mode}"
 
@@ -254,7 +257,7 @@ def handle_command(text: str, memory: MemoryStore,
     if t.lower().startswith("set verbosity:"):
         level = t.split(":", 1)[1].strip().lower()
         if level not in ("full", "normal", "final"):
-            return "Invalid verbosity. Use: Set Verbosity: full | normal | final"
+            return "Invalid verbosity. Use: Set Verbosity: full | normal | final."
 
         memory.set_verbosity(level)
         return f"Verbosity set to: {level}"
@@ -266,7 +269,7 @@ def _safe_input(prompt: str) -> Optional[str]:
     try:
         return input(prompt)
     except EOFError:
-        print("\nNo interactive input available (EOF).")
+        print("\nNo interactive input (EOF). Check terminal settings.")
         return None
 
 
@@ -280,7 +283,7 @@ def _prompt_yes_no(prompt: str) -> bool:
             return True
         if a in ("n", "no"):
             return False
-        print("Please answer: yes or no")
+        print("Enter yes or no.")
 
 
 def _run_git(repo_root: str, args):
@@ -415,13 +418,13 @@ if __name__ == "__main__":
             text = input("> ").strip()
         except EOFError:
             # Happens if the run console doesn't provide stdin (or closes it)
-            print("\nNo interactive input available (EOF). Check PyCharm run config: enable 'Emulate terminal'.")
+            print("\nNo interactive input (EOF). Enable 'Emulate terminal' in PyCharm run config.")
             break
 
         if not text:
             # If we're waiting for a yes/no on a dev patch, don't exit on empty input.
             if pending_dev_report is not None:
-                print("Please answer: yes or no")
+                print("Enter yes or no.")
                 continue
             break
 
@@ -471,7 +474,7 @@ if __name__ == "__main__":
 
                         # Replace pending report with the new proposal and go back to yes/no apply.
                         pending_dev_report = fix_report
-                        print("\nApply patch? (yes/no):")
+                        print("\nApply patch? (yes/no)")
                         continue
 
                 # Update provider stats ONLY after an explicit apply confirmation.
@@ -524,14 +527,14 @@ if __name__ == "__main__":
 
                 # Offer commit + push after successful apply + validation
                 if pending_dev_report["apply"].get("applied") and pending_dev_report["apply"].get("validation_ok"):
-                    if _prompt_yes_no("Commit and push to GitHub? (yes/no) "):
+                    if _prompt_yes_no("Commit and push to GitHub? (yes/no)"):
                         commit_msg = _safe_input("Commit message: ")
                         if commit_msg is None:
                             pass
                         else:
                             commit_msg = commit_msg.strip()
                             if not commit_msg:
-                                print("Commit message cannot be empty.")
+                                print("Commit message is empty.")
                             else:
                                 changed_files = pending_dev_report["apply"].get("changed_files", []) or []
                                 if not changed_files:
@@ -551,7 +554,7 @@ if __name__ == "__main__":
                                             else:
                                                 if out:
                                                     print(out)
-                                                if _prompt_yes_no("Push now? (yes/no) "):
+                                                if _prompt_yes_no("Push now? (yes/no)"):
                                                     ok, out = _run_git(".", ["push"])
                                                     if not ok:
                                                         print(f"Git push failed: {out}")
@@ -569,7 +572,7 @@ if __name__ == "__main__":
 
             # If they typed something else, keep waiting for a valid yes/no
             if not pending_dev_invalid_shown and answer:
-                print("Please answer: yes or no")
+                print("Enter yes or no.")
                 pending_dev_invalid_shown = True
             continue
 
@@ -587,7 +590,7 @@ if __name__ == "__main__":
         if text.lower().startswith("dev:"):
             dev_request = text.split(":", 1)[1].strip()
             if not dev_request:
-                print("Usage: Dev: <describe the change you want>")
+                print("Usage: Dev: <change request>")
                 continue
 
             _show_dev_progress("request", "Requesting patch proposal")
@@ -614,7 +617,7 @@ if __name__ == "__main__":
 
             pending_dev_report = report
             pending_dev_invalid_shown = False
-            print("\nApply patch? (yes/no):")
+            print("\nApply patch? (yes/no)")
             continue
 
         # --------------------

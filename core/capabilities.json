@@ -1,109 +1,71 @@
 {
   "project_name": "AI-Orchestrator",
   "version": "0.2.0",
-
   "providers": {
-  "gemini": {
-    "enabled": true,
-    "env_key_required": "GOOGLE_API_KEY",
-    "default_model": "gemini-2.5-flash",
-
-    "strengths": ["general", "summarize", "rewrite", "multimodal"],
-    "judge_strengths": ["general_judge", "writing_judge", "comparison_judge"],
-
-    "cost_tier": "low",
-    "latency_tier": "fast",
-
-    "notes": "Use short model name (no 'models/'). Example: gemini-2.5-flash."
+    "openai": {
+      "enabled": true,
+      "env_key_required": "OPENAI_API_KEY",
+      "default_model": "gpt-4o-mini",
+      "strengths": ["code", "planning", "tool_use"],
+      "judge_strengths": ["code_judge", "general_judge", "comparison_judge"],
+      "cost_tier": "low",
+      "latency_tier": "fast",
+      "notes": "Requires a valid OpenAI API key in .env."
+    },
+    "openai_dev": {
+      "enabled": true,
+      "env_key_required": "OPENAI_API_KEY",
+      "default_model": "gpt-5.2-codex",
+      "strengths": ["code", "reasoning", "self_modification"],
+      "judge_strengths": ["code_judge", "comparison_judge", "general_judge"],
+      "cost_tier": "high",
+      "latency_tier": "medium",
+      "notes": "Developer-grade OpenAI model for judging and self-patching."
+    },
+    "claude": {
+      "enabled": true,
+      "env_key_required": "ANTHROPIC_API_KEY",
+      "default_model": "claude-sonnet-4-5",
+      "strengths": ["writing", "code"],
+      "judge_strengths": ["writing_judge", "code_judge", "general_judge"],
+      "cost_tier": "medium",
+      "latency_tier": "medium",
+      "notes": "General Claude worker."
+    },
+    "claude_dev": {
+      "enabled": true,
+      "env_key_required": "ANTHROPIC_API_KEY",
+      "default_model": "claude-sonnet-4-5",
+      "strengths": ["code", "writing"],
+      "judge_strengths": ["code_judge", "writing_judge", "comparison_judge", "general_judge"],
+      "cost_tier": "high",
+      "latency_tier": "medium",
+      "notes": "Developer-grade Claude for self-patching/judging."
+    },
+    "ollama_local": {
+      "enabled": true,
+      "env_key_required": null,
+      "default_model": "gpt-oss:20b",
+      "strengths": ["general", "code", "local"],
+      "judge_strengths": ["general_judge", "code_judge", "comparison_judge"],
+      "cost_tier": "low",
+      "latency_tier": "fast",
+      "notes": "Local Ollama model via http://localhost:11434 (no API key required)."
+    }
   },
-
-  "openai": {
-    "enabled": true,
-    "env_key_required": "OPENAI_API_KEY",
-    "default_model": "gpt-4o-mini",
-
-    "strengths": ["code", "planning", "tool_use"],
-    "judge_strengths": ["code_judge", "general_judge", "comparison_judge"],
-
-    "cost_tier": "low",
-    "latency_tier": "fast",
-
-    "notes": "Requires a valid OpenAI API key in .env."
-  },
-
-  "openai_dev": {
-    "enabled": true,
-    "env_key_required": "OPENAI_API_KEY",
-    "default_model": "gpt-5.2-codex",
-
-    "strengths": ["code", "reasoning", "self_modification"],
-    "judge_strengths": ["code_judge", "comparison_judge", "general_judge"],
-
-    "cost_tier": "high",
-    "latency_tier": "medium",
-
-    "notes": "Developer-grade OpenAI model for judging and self-patching."
-  },
-
-  "claude": {
-    "enabled": true,
-    "env_key_required": "ANTHROPIC_API_KEY",
-    "default_model": "claude-sonnet-4-5",
-
-    "strengths": ["writing", "code"],
-    "judge_strengths": ["writing_judge", "code_judge", "general_judge"],
-
-    "cost_tier": "medium",
-    "latency_tier": "medium",
-
-    "notes": "General Claude worker."
-  },
-
-  "claude_dev": {
-    "enabled": true,
-    "env_key_required": "ANTHROPIC_API_KEY",
-    "default_model": "claude-sonnet-4-5",
-
-    "strengths": ["code", "writing"],
-    "judge_strengths": ["code_judge", "writing_judge", "comparison_judge", "general_judge"],
-
-    "cost_tier": "high",
-    "latency_tier": "medium",
-
-    "notes": "Developer-grade Claude for self-patching/judging."
-  },
-
-  "ollama_local": {
-    "enabled": true,
-    "env_key_required": null,
-    "default_model": "gpt-oss:20b",
-
-    "strengths": ["general", "code", "local"],
-    "judge_strengths": ["general_judge", "code_judge", "comparison_judge"],
-
-    "cost_tier": "low",
-    "latency_tier": "fast",
-
-    "notes": "Local Ollama model via http://localhost:11434 (no API key required)."
-  }
-},
-
   "tools": {
     "local": {
       "enabled": true,
       "supports": ["read_file", "write_file", "list_dir"]
     }
   },
-
   "routing_rules": {
     "local_first_keywords": ["read file", "open file", "write file", "save file", "list files"],
     "multi_model_keywords": ["compare", "debate", "two models", "validate", "double check"]
   },
-
   "judge": {
     "default_mode": "auto",
     "default_provider": "openai",
-
     "task_intent_keywords": {
       "code_judge": ["code", "python", "bug", "error", "stack trace", "refactor"],
       "writing_judge": ["rewrite", "tone", "email", "polish", "copy", "caption"],
@@ -111,10 +73,10 @@
     }
   },
   "dev": {
-   "default_mode": "auto",
+    "default_mode": "auto",
     "default_judge_provider": "openai_dev",
     "min_authors": 2,
     "max_authors": 4,
     "exploration_rate": 0.35
-    }
+  }
 }

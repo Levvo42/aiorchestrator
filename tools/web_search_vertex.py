@@ -27,14 +27,14 @@ def web_search_vertex_status(query: str, num_results: int = 3) -> Tuple[List[Dic
         serving_config = require_env_var("VERTEX_SERVING_CONFIG")
         require_env_var("VERTEX_DATA_STORE_ID")
     except RuntimeError as exc:
-        print(f"WebSearch: vertex_search FAILED reason=\"{exc}\"")
+        print(f"WebSearch vertex_search: missing_env detail=\"{exc}\"")
         return [], "missing_env", str(exc)
 
     try:
         import google.auth
         from google.auth.transport.requests import Request
     except Exception as exc:
-        print(f"WebSearch: vertex_search FAILED reason=\"{exc}\"")
+        print(f"WebSearch vertex_search: provider_unavailable detail=\"{exc}\"")
         return [], "provider_unavailable", str(exc)
 
     try:
@@ -42,7 +42,7 @@ def web_search_vertex_status(query: str, num_results: int = 3) -> Tuple[List[Dic
         credentials.refresh(Request())
         token = credentials.token
     except Exception as exc:
-        print(f"WebSearch: vertex_search FAILED reason=\"{exc}\"")
+        print(f"WebSearch vertex_search: auth_failed detail=\"{exc}\"")
         return [], "auth_failed", str(exc)
 
     path = (
@@ -68,10 +68,10 @@ def web_search_vertex_status(query: str, num_results: int = 3) -> Tuple[List[Dic
             err_body = exc.read().decode("utf-8", errors="ignore")
         except Exception:
             err_body = ""
-        print(f"WebSearch: vertex_search HTTPError status={exc.code} body={err_body}")
+        print(f"WebSearch vertex_search: http_error status={exc.code} body={err_body}")
         return [], status, f"http_{exc.code}"
     except Exception as exc:
-        print(f"WebSearch: vertex_search FAILED reason=\"{exc}\"")
+        print(f"WebSearch vertex_search: request_failed detail=\"{exc}\"")
         return [], "error", str(exc)
 
     try:

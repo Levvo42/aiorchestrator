@@ -1,5 +1,10 @@
 Configuration
 
+Brave Search (Open Web)
+- Sign up for Brave Search API and create an API key.
+- Set `BRAVE_SEARCH_API_KEY`.
+- Optional: set `BRAVE_SEARCH_ENDPOINT` to override the default `https://api.search.brave.com/res/v1/web/search`.
+
 Vertex AI Search (Discovery Engine)
 - `GOOGLE_APPLICATION_CREDENTIALS` (service account path)
 - `VERTEX_PROJECT_ID`

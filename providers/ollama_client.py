@@ -39,7 +39,7 @@ class OllamaClient:
           str: model output text
         """
         system_prefix = (
-            "System: You are a locally running language model accessed via Ollama.\n"
+            "System: Role: local model served by Ollama.\n"
             "System: Do not claim cloud hosting or OpenAI infrastructure.\n\n"
         )
         full_prompt = f"{system_prefix}{prompt}"
@@ -62,9 +62,9 @@ class OllamaClient:
                 body = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             error_body = exc.read().decode("utf-8") if exc.fp else ""
-            raise RuntimeError(f"Ollama error {exc.code}: {error_body or exc.reason}") from exc
+            raise RuntimeError(f"Ollama HTTP {exc.code}: {error_body or exc.reason}") from exc
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"Ollama request failed: {exc.reason}") from exc
+            raise RuntimeError(f"Ollama request failed: {exc.reason}. Check OLLAMA_BASE_URL.") from exc
 
         data = json.loads(body)
         return data.get("response", "")
