@@ -422,9 +422,8 @@ if __name__ == "__main__":
             break
 
         if not text:
-            # If we're waiting for a yes/no on a dev patch, don't exit on empty input.
+            # If we're waiting for a yes/no on a dev patch, ignore empty input.
             if pending_dev_report is not None:
-                print("Enter yes or no.")
                 continue
             break
 
@@ -614,6 +613,10 @@ if __name__ == "__main__":
 
             print("\n=== PROPOSED PATCH ===")
             print(report["chosen_patch"] or "(no patch produced)")
+
+            if not report.get("chosen_patch"):
+                print("\nNo valid patch candidates; nothing to apply.")
+                continue
 
             pending_dev_report = report
             pending_dev_invalid_shown = False
