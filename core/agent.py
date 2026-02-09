@@ -36,6 +36,7 @@ from core.general_routing import (
     build_local_evidence_prompt,
     classify_intent,
     decide_general_route,
+    is_authoritative_query,
     is_factual_query,
     parse_local_assessment,
     summarize_evidence,
@@ -43,7 +44,8 @@ from core.general_routing import (
 
 # Local tools
 from tools.local_exec import read_file, write_file, list_dir
-from tools.web_search_google import web_search_google_status
+from tools.web_search import web_search
+from tools.web_search_vertex import web_search_vertex_status
 
 # Provider clients (safe to import; actual instantiation happens in __init__)
 from providers.openai_client import OpenAIClient
@@ -341,7 +343,7 @@ class Agent:
 
         invalid_json = assessment is None
         if assessment is None:
-            factual = is_factual_query(task)
+            factual = is_factual_query(task) or is_authoritative_query(task)
             assessment = {
                 "final_answer": local_raw.strip(),
                 "confidence": 0.0,
@@ -392,27 +394,70 @@ class Agent:
             print(f"Route: local (conf={confidence:.2f})")
         elif route == "web":
             used_web = True
-            results, status, reason_detail = web_search_google_status(query, num_results=3)
-            search_tool = "google_cse"
-            providers_used.append(f"web_search_{search_tool}")
-            execution["local"].append(
-                {
-                    "tool": f"web_search_{search_tool}",
-                    "args": {"query": query},
-                    "success": status == "ok",
-                    "output": results,
-                    "error": "" if status == "ok" else reason_detail,
-                }
-            )
-            if status == "ok":
-                print(f"WebSearch: google_cse query=\"{query}\" results={len(results)}")
-            elif status == "empty":
-                print("WebSearch: google_cse EMPTY")
-            else:
-                print(f"WebSearch: google_cse FAILED reason=\"{reason_detail}\"")
+            authoritative = is_authoritative_query(task)
+            results = []
+            status = "error"
+            reason_detail = ""
+            search_tool = ""
 
-            if status != "ok":
-                search_tool = "google_cse"
+            def _low_quality(items: list[dict]) -> bool:
+                if not items:
+                    return True
+                has_url = any(bool(i.get("url")) for i in items)
+                has_snippet = any(bool(i.get("snippet")) for i in items)
+                return not (has_url and has_snippet)
+
+            def _log_search(tool_name: str, tool_status: str, detail: str, count: int) -> None:
+                if tool_status == "ok":
+                    print(f"WebSearch: {tool_name} query=\"{query}\" results={count}")
+                elif tool_status in ("empty_results", "empty"):
+                    print(f"WebSearch: {tool_name} EMPTY")
+                else:
+                    print(f"WebSearch: {tool_name} FAILED reason=\"{detail}\"")
+
+            def _record_search(tool_name: str, tool_status: str, items: list[dict], detail: str) -> None:
+                providers_used.append(f"web_search_{tool_name}")
+                execution["local"].append(
+                    {
+                        "tool": f"web_search_{tool_name}",
+                        "args": {"query": query},
+                        "success": tool_status == "ok",
+                        "output": items,
+                        "error": "" if tool_status == "ok" else detail,
+                    }
+                )
+
+            if authoritative:
+                results, status, reason_detail = web_search_vertex_status(query, num_results=3)
+                search_tool = "vertex_search"
+                _record_search(search_tool, status, results, reason_detail)
+                _log_search("vertex_search", status, reason_detail, len(results))
+                if status != "ok" or _low_quality(results):
+                    open_results = web_search(query, max_results=3)
+                    open_status = "ok" if open_results else "empty_results"
+                    _record_search("open_web", open_status, open_results, "empty_results")
+                    _log_search("open_web", open_status, "empty_results", len(open_results))
+                    if open_results:
+                        results = open_results
+                        status = "ok"
+                        search_tool = "open_web"
+            else:
+                open_results = web_search(query, max_results=3)
+                open_status = "ok" if open_results else "empty_results"
+                _record_search("open_web", open_status, open_results, "empty_results")
+                _log_search("open_web", open_status, "empty_results", len(open_results))
+                results = open_results
+                status = open_status
+                search_tool = "open_web"
+                if status != "ok" or _low_quality(results):
+                    vertex_results, vertex_status, vertex_detail = web_search_vertex_status(query, num_results=3)
+                    _record_search("vertex_search", vertex_status, vertex_results, vertex_detail)
+                    _log_search("vertex_search", vertex_status, vertex_detail, len(vertex_results))
+                    if vertex_status == "ok":
+                        results = vertex_results
+                        status = "ok"
+                        search_tool = "vertex_search"
+
             evidence = summarize_evidence(results)
             web_weak = len(results) < 1
             if web_weak:

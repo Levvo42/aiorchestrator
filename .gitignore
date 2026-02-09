@@ -24,3 +24,7 @@ venv/
 memory/state.json
 memory/*.log
 memory/state.local.json
+
+#Credentials
+credentials/
+*.json

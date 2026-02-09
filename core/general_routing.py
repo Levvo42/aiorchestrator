@@ -38,6 +38,20 @@ FACTUAL_KEYWORDS = (
 CODING_KEYWORDS = ("bug", "error", "stack trace", "python", "code", "refactor", "function", "class")
 WRITING_KEYWORDS = ("rewrite", "tone", "email", "polish", "copy", "caption", "summarize", "summary")
 PLANNING_KEYWORDS = ("plan", "roadmap", "milestone", "strategy", "steps", "outline")
+AUTHORITATIVE_KEYWORDS = (
+    "side effects",
+    "dosage",
+    "contraindications",
+    "laws",
+    "regulations",
+    "statute",
+    "official statistics",
+    "research",
+    "study",
+    "clinical",
+    "guideline",
+    "policy",
+)
 
 
 def classify_intent(task: str) -> str:
@@ -60,6 +74,11 @@ def is_factual_query(task: str) -> bool:
     if "?" in t and any(w in t for w in ("what", "which", "how many", "how much")):
         return True
     return False
+
+
+def is_authoritative_query(task: str) -> bool:
+    t = (task or "").lower()
+    return any(k in t for k in AUTHORITATIVE_KEYWORDS)
 
 
 def build_local_assessment_prompt(task: str, threshold: float) -> str:

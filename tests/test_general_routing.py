@@ -159,8 +159,9 @@ class GeneralRoutingTests(unittest.TestCase):
             api = StubProvider("API answer")
             agent.provider_map = {"ollama_local": local, "openai_dev": api}
 
-            with patch("core.agent.web_search_google_status", return_value=([{"title": "t", "snippet": "s", "url": "u"}], "ok", "")):
-                run = agent.run("When was the digital clock invented?")
+            with patch("core.agent.web_search", return_value=[{"title": "t", "snippet": "s", "url": "u"}]):
+                with patch("core.agent.web_search_vertex_status", return_value=([], "empty_results", "empty_results")):
+                    run = agent.run("When was the digital clock invented?")
 
             self.assertEqual(len(local.calls), 2)
             self.assertEqual(len(api.calls), 0)
@@ -203,11 +204,12 @@ class GeneralRoutingTests(unittest.TestCase):
             api = StubProvider(["API answer"])
             agent.provider_map = {"ollama_local": local, "openai_dev": api}
 
-            with patch("core.agent.web_search_google_status", return_value=([{"title": "t", "snippet": "s", "url": "u"}], "ok", "")):
-                run = agent.run("When was the digital clock invented?")
+            with patch("core.agent.web_search", return_value=[{"title": "t", "snippet": "s", "url": "u"}]):
+                with patch("core.agent.web_search_vertex_status", return_value=([], "empty_results", "empty_results")):
+                    run = agent.run("When was the digital clock invented?")
 
             self.assertEqual(run["routing"]["route"], "local->web")
-            self.assertEqual(run["routing"]["search_tool"], "google_cse")
+            self.assertEqual(run["routing"]["search_tool"], "open_web")
             self.assertEqual(len(api.calls), 0)
 
     def test_weather_query_uses_web(self) -> None:
@@ -247,8 +249,9 @@ class GeneralRoutingTests(unittest.TestCase):
             api = StubProvider(["API answer"])
             agent.provider_map = {"ollama_local": local, "openai_dev": api}
 
-            with patch("core.agent.web_search_google_status", return_value=([{"title": "t", "snippet": "s", "url": "u"}], "ok", "")):
-                run = agent.run("How's the weather in Duved, Sweden?")
+            with patch("core.agent.web_search", return_value=[{"title": "t", "snippet": "s", "url": "u"}]):
+                with patch("core.agent.web_search_vertex_status", return_value=([], "empty_results", "empty_results")):
+                    run = agent.run("How's the weather in Duved, Sweden?")
 
             self.assertEqual(run["routing"]["route"], "local->web")
             self.assertEqual(len(api.calls), 0)
@@ -289,11 +292,58 @@ class GeneralRoutingTests(unittest.TestCase):
             api = StubProvider("API answer")
             agent.provider_map = {"ollama_local": local, "openai_dev": api}
 
-            with patch("core.agent.web_search_google_status", return_value=([], "error", "boom")):
-                run = agent.run("How's the weather in Duved, Sweden?")
+            with patch("core.agent.web_search", return_value=[]):
+                with patch("core.agent.web_search_vertex_status", return_value=([], "error", "boom")):
+                    run = agent.run("How's the weather in Duved, Sweden?")
 
             self.assertEqual(run["routing"]["route"], "local->web->api")
             self.assertGreater(len(api.calls), 0)
+
+    def test_authoritative_query_uses_vertex_first(self) -> None:
+        class StubProvider:
+            def __init__(self, responses: list[str]) -> None:
+                self.responses = responses
+                self.calls = []
+
+            def generate(self, prompt: str) -> str:
+                self.calls.append(prompt)
+                return self.responses.pop(0)
+
+        capabilities = {
+            "providers": {
+                "ollama_local": {"enabled": True},
+                "openai_dev": {"enabled": True},
+            },
+            "routing_rules": {},
+            "judge": {"task_intent_keywords": {}},
+            "dev": {},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = MemoryStore(
+                state_path=str(Path(tmp) / "state.local.json"),
+                seed_path=str(Path(tmp) / "state.json"),
+            )
+            memory.set_setting("general_mode", "auto")
+
+            agent = Agent(capabilities=capabilities, memory=memory)
+            local = StubProvider([
+                '{"final_answer": "Not sure", "confidence": 0.2, "escalate_to": "none", '
+                '"search_query": "ibuprofen side effects", "uncertainty_reasons": [], '
+                '"suggested_search_query": ""}',
+                "Side effects with Source: http://example.com",
+            ])
+            api = StubProvider(["API answer"])
+            agent.provider_map = {"ollama_local": local, "openai_dev": api}
+
+            with patch("core.agent.web_search_vertex_status", return_value=([{"title": "t", "snippet": "s", "url": "u"}], "ok", "")) as vertex_mock:
+                with patch("core.agent.web_search", return_value=[]) as open_mock:
+                    run = agent.run("What are the side effects of ibuprofen?")
+
+            self.assertEqual(run["routing"]["search_tool"], "vertex_search")
+            self.assertEqual(len(api.calls), 0)
+            self.assertEqual(vertex_mock.call_count, 1)
+            self.assertEqual(open_mock.call_count, 0)
 
 
 if __name__ == "__main__":
