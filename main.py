@@ -406,7 +406,7 @@ if __name__ == "__main__":
     pending_dev_report = None
     last_applied_dev_report = None
     pending_dev_invalid_shown = False
-
+    pending_dev_prompt_shown = False
 
     print("AI-Orchestrator v0.2 (with Judge)")
     print("Commands: Show Judge | Set Judge: openai | Set Judge Mode: auto/fixed")
@@ -431,6 +431,10 @@ if __name__ == "__main__":
         # A) PENDING DEV CONFIRMATION STATE (YES/NO consumes input)
         # ---------------------------------------------------------
         if pending_dev_report is not None:
+            if not pending_dev_prompt_shown:
+                print("\nApply patch? (yes/no)")
+                pending_dev_prompt_shown = True
+
             answer = text.strip().lower()
 
             if answer in ("y", "yes"):
@@ -473,7 +477,8 @@ if __name__ == "__main__":
 
                         # Replace pending report with the new proposal and go back to yes/no apply.
                         pending_dev_report = fix_report
-                        print("\nApply patch? (yes/no)")
+                        pending_dev_invalid_shown = False
+                        pending_dev_prompt_shown = False
                         continue
 
                 # Update provider stats ONLY after an explicit apply confirmation.
@@ -561,12 +566,14 @@ if __name__ == "__main__":
                                                         print(out)
 
                 pending_dev_report = None
+                pending_dev_prompt_shown = False
                 continue
 
             if answer in ("n", "no"):
                 pending_dev_invalid_shown = False
                 print("Patch not applied.")
                 pending_dev_report = None
+                pending_dev_prompt_shown = False
                 continue
 
             # If they typed something else, keep waiting for a valid yes/no
@@ -620,7 +627,7 @@ if __name__ == "__main__":
 
             pending_dev_report = report
             pending_dev_invalid_shown = False
-            print("\nApply patch? (yes/no)")
+            pending_dev_prompt_shown = False
             continue
 
         # --------------------

@@ -25,8 +25,77 @@ _META_PREFIXES = (
 )
 
 
+def _strip_markdown_fences(text: str) -> str:
+    """Remove common accidental wrappers like ```diff fences or quote blocks."""
+    t = (text or "").strip()
+
+    # Common copy/paste quoting
+    if t.startswith("> "):
+        t = t[2:].lstrip()
+
+    if not t.startswith("```"):
+        return t
+
+    lines = t.splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _normalize_unified_diff(raw_text: str) -> str:
+    """Extract the diff portion from noisy model output.
+
+    We accept that LLMs sometimes include code fences or a short prelude.
+    The returned diff always ends with a newline.
+    """
+    t = _strip_markdown_fences(raw_text)
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+
+    lines = (t or "").splitlines()
+    first = next((i for i, l in enumerate(lines) if l.startswith("diff --git ")), None)
+    if first is None:
+        return (t or "").strip()
+
+    # Drop leading junk.
+    lines = lines[first:]
+
+    # Drop trailing junk (keep only lines that plausibly belong to a diff).
+    def _looks_like_diff_line(l: str) -> bool:
+        if not l:
+            return True
+        if l.startswith((
+            "diff --git ",
+            "--- ",
+            "+++ ",
+            "@@ ",
+            " ",
+            "+",
+            "-",
+            "Binary files ",
+            "GIT binary patch",
+            "\\ No newline at end of file",
+        )):
+            return True
+        if any(l.startswith(p) for p in _META_PREFIXES):
+            return True
+        return False
+
+    last = None
+    for i in range(len(lines) - 1, -1, -1):
+        if _looks_like_diff_line(lines[i].rstrip("\n")):
+            last = i
+            break
+    if last is not None:
+        lines = lines[: last + 1]
+
+    out = "\n".join(lines).strip("\n") + "\n"
+    return out
+
+
 def _validate_unified_diff(diff_text: str) -> None:
-    t = (diff_text or "").strip()
+    t = _normalize_unified_diff(diff_text).strip()
     if not t:
         raise RuntimeError("Refusing to apply patch: empty diff.")
 
@@ -34,8 +103,6 @@ def _validate_unified_diff(diff_text: str) -> None:
     first_diff_idx = next((i for i, l in enumerate(lines) if l.startswith("diff --git ")), None)
     if first_diff_idx is None:
         raise RuntimeError("Refusing to apply patch: missing 'diff --git' header.")
-    if first_diff_idx > 0:
-        raise RuntimeError("Refusing to apply patch: leading garbage before first diff header.")
 
     i = 0
     in_block = False
@@ -146,6 +213,7 @@ def _has_rejects(repo_root: str) -> bool:
 
 def apply_patches(repo_root: str, diff_text: str) -> Dict[str, str]:
     repo_root = str(Path(repo_root).resolve())
+    diff_text = _normalize_unified_diff(diff_text)
     _validate_unified_diff(diff_text)
     diff_text = _sanitize_diff(diff_text)
 

@@ -95,6 +95,52 @@ def _strip_markdown_fences(text: str) -> str:
         lines = lines[:-1]
     return "\n".join(lines).strip()
 
+def _normalize_unified_diff(raw_text: str) -> str:
+    """Extract the diff portion from noisy model output.
+
+    We accept that some models may include code fences or a short prelude.
+    The returned diff always ends with a newline.
+    """
+    t = _strip_markdown_fences(raw_text)
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+
+    lines = (t or "").splitlines()
+    first = next((i for i, l in enumerate(lines) if l.startswith("diff --git ")), None)
+    if first is None:
+        return (t or "").strip()
+
+    lines = lines[first:]
+
+    def _looks_like_diff_line(l: str) -> bool:
+        if not l:
+            return True
+        if l.startswith((
+            "diff --git ",
+            "--- ",
+            "+++ ",
+            "@@ ",
+            " ",
+            "+",
+            "-",
+            "Binary files ",
+            "GIT binary patch",
+            "\\ No newline at end of file",
+        )):
+            return True
+        if any(l.startswith(p) for p in _META_PREFIXES):
+            return True
+        return False
+
+    last = None
+    for i in range(len(lines) - 1, -1, -1):
+        if _looks_like_diff_line(lines[i].rstrip("\n")):
+            last = i
+            break
+    if last is not None:
+        lines = lines[: last + 1]
+
+    return "\n".join(lines).strip("\n") + "\n"
+
 
 def _safe_json_load(s: str) -> Optional[dict]:
     try:
@@ -307,136 +353,122 @@ def _run_api_judge(
 
 def _validate_unified_diff(diff_text: str) -> Tuple[bool, str]:
     """
-    Structural validation to prevent 'corrupt patch' / 'patch fragment without header' errors.
+    Structural validation to prevent git-apply errors like:
+      - 'corrupt patch'
+      - 'patch fragment without header'
 
-    Rules:
-    - Must include at least one 'diff --git a/... b/...'
-    - No leading garbage before first diff header
-    - No orphan hunks: '@@ ... @@' must only appear AFTER both '---' and '+++'
-    - No headers after hunks started within a file block
-    - Each diff block must contain '---' and '+++', and at least one hunk
+    Assumes _normalize_unified_diff(...) already:
+      - strips markdown fences
+      - removes leading/trailing non-diff text
+      - returns only the diff starting at first 'diff --git'
     """
-    t = (diff_text or "").strip()
+    t = _normalize_unified_diff(diff_text).strip()
     if not t:
         return False, "Patch is empty."
 
     lines = t.splitlines()
-
-    # Reject obvious non-diff outputs early
     if not any(l.startswith("diff --git ") for l in lines):
         return False, "Patch missing 'diff --git' header."
 
-    # Reject patches with leading garbage (common LLM failure mode)
-    first_diff_idx = next((i for i, l in enumerate(lines) if l.startswith("diff --git ")), None)
-    if first_diff_idx is None:
-        return False, "Patch missing 'diff --git' header."
-    if first_diff_idx > 0:
-        return False, f"Patch has {first_diff_idx} leading lines before the first 'diff --git' header."
-
     i = 0
-    blocks = 0
-    in_block = False
-
     while i < len(lines):
         line = lines[i]
 
-        # Orphan hunk outside any diff block
-        if _HUNK_RE.match(line) and not in_block:
+        # Disallow orphan hunks (hunk headers can't exist outside a file diff block)
+        if _HUNK_RE.match(line):
             return False, "Orphan hunk '@@' outside any diff block."
 
-        if line.startswith("diff --git "):
-            m = _DIFF_GIT_RE.match(line)
-            if not m:
-                return False, f"Malformed diff header: '{line}'"
+        if not line.startswith("diff --git "):
+            return False, f"Unexpected line before first diff header: '{line}'"
 
-            blocks += 1
-            in_block = True
+        # --- Begin diff block ---
+        if not _DIFF_GIT_RE.match(line):
+            return False, f"Malformed diff header: '{line}'"
 
-            saw_minus = False
-            saw_plus = False
-            saw_hunk = False
-            in_hunk = False
-            hunk_old_remaining = 0
-            hunk_new_remaining = 0
-
-            i += 1
-            while i < len(lines) and not lines[i].startswith("diff --git "):
-                l = lines[i]
-
-                # Disallow '---' / '+++' AFTER hunks started (this creates corrupt/fragment diffs)
-                if l.startswith("--- "):
-                    if saw_hunk:
-                        return False, "Malformed diff: '---' appears after hunks started."
-                    if not (l.startswith("--- a/") or l.startswith("--- /dev/null")):
-                        return False, f"Malformed '---' line: '{l}'"
-                    saw_minus = True
-
-                elif l.startswith("+++ "):
-                    if saw_hunk:
-                        return False, "Malformed diff: '+++' appears after hunks started."
-                    if not (l.startswith("+++ b/") or l.startswith("+++ /dev/null")):
-                        return False, f"Malformed '+++' line: '{l}'"
-                    saw_plus = True
-
-                elif _HUNK_RE.match(l):
-                    # Critical rule: hunks only allowed AFTER both file headers
-                    if not (saw_minus and saw_plus):
-                        return False, "Orphan hunk '@@' before file headers '---'/'+++'."
-                    m_hunk = _HUNK_PARSE_RE.match(l)
-                    if not m_hunk:
-                        return False, f"Malformed hunk header: '{l}'"
-                    old_count = int(m_hunk.group(2) or "1")
-                    new_count = int(m_hunk.group(4) or "1")
-                    hunk_old_remaining = old_count
-                    hunk_new_remaining = new_count
-                    in_hunk = True
-                    saw_hunk = True
-                elif in_hunk:
-                    if l.startswith("\\ No newline at end of file"):
-                        pass
-                    elif l.startswith(" "):
-                        hunk_old_remaining -= 1
-                        hunk_new_remaining -= 1
-                    elif l.startswith("-"):
-                        hunk_old_remaining -= 1
-                    elif l.startswith("+"):
-                        hunk_new_remaining -= 1
-                    else:
-                        return False, f"Unexpected line inside hunk: '{l}'"
-                    if hunk_old_remaining < 0 or hunk_new_remaining < 0:
-                        return False, "Hunk line counts do not match header."
-                    if hunk_old_remaining == 0 and hunk_new_remaining == 0:
-                        in_hunk = False
-                else:
-                    # Pre-hunk metadata lines we allow; reject anything else to avoid corrupt patches.
-                    if l.startswith("index "):
-                        if not _INDEX_RE.match(l.strip()):
-                            return False, f"Malformed index line: '{l}'"
-                    elif any(l.startswith(p) for p in _META_PREFIXES):
-                        pass
-                    elif l.startswith("Binary files ") or l.startswith("GIT binary patch"):
-                        return False, "Binary patches are not supported."
-                    else:
-                        return False, f"Unexpected line before hunks: '{l}'"
-
-                i += 1
-
-            if in_hunk:
-                return False, "Hunk line counts do not match header."
-            if not (saw_minus and saw_plus):
-                return False, "Missing '--- a/...' and/or '+++ b/...' in a diff block."
-            if not saw_hunk:
-                return False, "Missing hunk header '@@ -.. +.. @@' in a diff block."
-
-            # End of this diff block
-            continue
+        saw_minus = False
+        saw_plus = False
+        saw_hunk = False
+        in_hunk = False
+        hunk_old_remaining = 0
+        hunk_new_remaining = 0
 
         i += 1
+        while i < len(lines) and not lines[i].startswith("diff --git "):
+            l = lines[i]
 
-    if blocks == 0:
-        return False, "No diff blocks found."
+            if l.startswith("--- "):
+                if saw_hunk:
+                    return False, "Malformed diff: '---' appears after hunks started."
+                if not (l.startswith("--- a/") or l.startswith("--- /dev/null")):
+                    return False, f"Malformed '---' line: '{l}'"
+                saw_minus = True
+
+            elif l.startswith("+++ "):
+                if saw_hunk:
+                    return False, "Malformed diff: '+++' appears after hunks started."
+                if not (l.startswith("+++ b/") or l.startswith("+++ /dev/null")):
+                    return False, f"Malformed '+++' line: '{l}'"
+                saw_plus = True
+
+            elif _HUNK_RE.match(l):
+                if not (saw_minus and saw_plus):
+                    return False, "Orphan hunk '@@' before file headers '---'/'+++'."
+                m_hunk = _HUNK_PARSE_RE.match(l)
+                if not m_hunk:
+                    return False, f"Malformed hunk header: '{l}'"
+
+                old_count = int(m_hunk.group(2) or "1")
+                new_count = int(m_hunk.group(4) or "1")
+                hunk_old_remaining = old_count
+                hunk_new_remaining = new_count
+                in_hunk = True
+                saw_hunk = True
+
+            elif in_hunk:
+                if l.startswith("\\ No newline at end of file"):
+                    pass
+                elif l.startswith(" "):
+                    hunk_old_remaining -= 1
+                    hunk_new_remaining -= 1
+                elif l.startswith("-"):
+                    hunk_old_remaining -= 1
+                elif l.startswith("+"):
+                    hunk_new_remaining -= 1
+                else:
+                    return False, f"Unexpected line inside hunk: '{l}'"
+
+                if hunk_old_remaining < 0 or hunk_new_remaining < 0:
+                    return False, "Hunk line counts do not match header."
+                if hunk_old_remaining == 0 and hunk_new_remaining == 0:
+                    in_hunk = False
+
+            else:
+                # Pre-hunk metadata we allow; reject anything else.
+                if l.startswith("index "):
+                    if not _INDEX_RE.match(l.strip()):
+                        return False, f"Malformed index line: '{l}'"
+                elif any(l.startswith(p) for p in _META_PREFIXES):
+                    pass
+                elif l.startswith("Binary files ") or l.startswith("GIT binary patch"):
+                    return False, "Binary patches are not supported."
+                else:
+                    return False, f"Unexpected line before hunks: '{l}'"
+
+            i += 1
+
+        # End diff block checks
+        if in_hunk:
+            return False, "Hunk line counts do not match header."
+        if not (saw_minus and saw_plus):
+            return False, "Missing '--- a/...' and/or '+++ b/...' in a diff block."
+        if not saw_hunk:
+            return False, "Missing hunk header '@@ -.. +.. @@' in a diff block."
+
+        # continue outer while at current i (either next diff block or end)
+        continue
 
     return True, "OK"
+
 
 def _check_patch_applies(repo_root: str, diff_text: str) -> Tuple[bool, str]:
     try:
