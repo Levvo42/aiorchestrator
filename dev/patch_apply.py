@@ -44,6 +44,46 @@ def _strip_markdown_fences(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _normalize_patch_text(text: str) -> str:
+    """
+    Normalize raw LLM output into a candidate patch string.
+
+    Behavior:
+    - If a Markdown/code fence (lines starting with ``` or ```diff) is present,
+      extract the content from the first matching pair of fences.
+    - After removing fences, locate the first literal occurrence of "diff --git"
+      and return the substring starting at that position through the end.
+    - If no "diff --git" exists, return the trimmed content.
+
+    Keep this helper deliberately small so higher-level heuristics can still run.
+    """
+    if not text:
+        return ""
+    lines = text.splitlines()
+    # Find first opening fence anywhere (line that starts with ```).
+    start_idx = next((i for i, l in enumerate(lines) if l.strip().startswith("```")), None)
+    content = text
+    if start_idx is not None:
+        # Find closing fence after the opening.
+        end_idx = next((i for i in range(start_idx + 1, len(lines)) if lines[i].strip().startswith("```")), None)
+        if end_idx is not None:
+            # Extract inner content between fences.
+            inner_lines = lines[start_idx + 1 : end_idx]
+            content = "\n".join(inner_lines)
+        else:
+            # No closing fence; take everything after the opening fence line.
+            inner_lines = lines[start_idx + 1 :]
+            content = "\n".join(inner_lines)
+    # Normalize line endings and trim
+    content = content.replace("\r\n", "\n").replace("\r", "\n")
+    # If a diff header appears, return starting at the first 'diff --git'
+    idx = content.find("diff --git")
+    if idx != -1:
+        return content[idx:].strip()
+    # Otherwise return trimmed content (so existing validators get to decide)
+    return content.strip()
+
+
 def _normalize_unified_diff(raw_text: str) -> str:
     """Extract the diff portion from noisy model output.
 
@@ -95,7 +135,8 @@ def _normalize_unified_diff(raw_text: str) -> str:
 
 
 def _validate_unified_diff(diff_text: str) -> None:
-    t = _normalize_unified_diff(diff_text).strip()
+    # Normalize candidate text first (strip fences and find first diff --git)
+    t = _normalize_patch_text(diff_text).strip()
     if not t:
         raise RuntimeError("Refusing to apply patch: empty diff.")
 
@@ -213,7 +254,8 @@ def _has_rejects(repo_root: str) -> bool:
 
 def apply_patches(repo_root: str, diff_text: str) -> Dict[str, str]:
     repo_root = str(Path(repo_root).resolve())
-    diff_text = _normalize_unified_diff(diff_text)
+    # Normalize candidate text first (strip fences and find first diff --git)
+    diff_text = _normalize_patch_text(diff_text)
     _validate_unified_diff(diff_text)
     diff_text = _sanitize_diff(diff_text)
 

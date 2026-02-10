@@ -55,6 +55,8 @@ def build_author_prompt(request: str, context: Any) -> str:
         "Task: produce one unified diff that implements the request.\n"
         "\n"
         "Output rules:\n"
+        # Prominent explicit requirement and sentinel if impossible
+        "Output MUST be a single unified git diff starting with diff --git and contain no extra text, no markdown or code fences. If you cannot produce a valid unified git diff, output exactly the string: NO_DIFF\n"
         "- Output only a unified diff suitable for `git apply`.\n"
         "- No markdown or explanations.\n"
         "- Omit all 'index ...' lines.\n"
@@ -99,6 +101,8 @@ def build_fix_author_prompt(
         "- The new diff must apply cleanly to the current context.\n"
         "\n"
         "Output rules:\n"
+        # Prominent explicit requirement and sentinel for fix-author as well
+        "Output MUST be a single unified git diff starting with diff --git and contain no extra text, no markdown or code fences. If you cannot produce a valid unified git diff, output exactly the string: NO_DIFF\n"
         "- Output only a unified diff suitable for `git apply`.\n"
         "- No markdown or prose.\n"
         "- Omit all 'index ...' lines.\n"
