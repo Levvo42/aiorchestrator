@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from dev.context import build_context_bundle
 from dev.policy import DevPolicy
 from dev.prompts import build_author_prompt, build_fix_author_prompt, build_judge_prompt, build_local_judge_prompt
-from dev.patch_apply import apply_patches
+from dev.patch_apply import apply_patches, _normalize_patch_text
 from dev.validate import py_compile_files, run_tests_if_available
 
 
@@ -685,8 +685,14 @@ def run_dev_request(
 
         try:
             patch_text = client.generate(author_prompt)
-            patch_text = _strip_markdown_fences(patch_text)
+            # Normalize patch candidate before any validation
+            normalized = _normalize_patch_text(patch_text)
+            if normalized.strip() == "NO_DIFF":
+                patch_text = "NO_DIFF"
+            else:
+                patch_text = normalized
 
+            # Use normalized patch_text for all subsequent checks
             ok, why = _validate_unified_diff(patch_text)
             if not ok:
                 author_outputs.append(
@@ -713,7 +719,8 @@ def run_dev_request(
         except Exception as e:
             author_outputs.append({"provider": provider_name, "success": False, "error": str(e)})
 
-    successful_patches = [o for o in author_outputs if o.get("success") and o.get("patch")]
+    # Only patches that are normalized and validated
+    successful_patches = [o for o in author_outputs if o.get("success") and o.get("patch") and o.get("patch") != "NO_DIFF"]
 
     # ----------------------------
     # 2) Judge chooses best patch
@@ -973,9 +980,15 @@ def run_dev_fix_request(
         if not client:
             continue
         try:
-            patch = _strip_markdown_fences(client.generate(author_prompt))
+            patch = client.generate(author_prompt)
+            # Normalize patch candidate before any validation
+            normalized = _normalize_patch_text(patch)
+            if normalized.strip() == "NO_DIFF":
+                patch = "NO_DIFF"
+            else:
+                patch = normalized
             ok, _ = _validate_unified_diff(patch)
-            if ok:
+            if ok and patch != "NO_DIFF":
                 ok, _ = _check_patch_applies(repo_root=repo_root, diff_text=patch)
                 if ok:
                     author_outputs.append(patch)
@@ -1013,7 +1026,12 @@ def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
     print("[Apply] Start")
     
     patch = (report.get("chosen_patch") or "").strip()
-    patch = _strip_markdown_fences(patch)
+    # Normalize patch before apply
+    normalized = _normalize_patch_text(patch)
+    if normalized.strip() == "NO_DIFF":
+        patch = "NO_DIFF"
+    else:
+        patch = normalized
 
     report.setdefault("apply", {})
     for k, v in {
@@ -1029,7 +1047,7 @@ def apply_dev_patch(repo_root: str, report: Dict[str, Any]) -> Dict[str, Any]:
     }.items():
         report["apply"].setdefault(k, v)
 
-    if not patch:
+    if not patch or patch == "NO_DIFF":
         report["apply"]["attempted"] = True
         report["apply"]["applied"] = False
         report["apply"]["error"] = "No patch to apply."
