@@ -54,7 +54,6 @@ from providers.claude_client import ClaudeClient
 from providers.ollama_client import OllamaClient
 
 
-
 class Agent:
     """
     Main orchestration agent.
@@ -327,14 +326,23 @@ class Agent:
         learned_conf = float(stats.get("per_intent", {}).get(intent, {}).get("confidence", 0.0) or 0.0)
 
         local_prompt = build_local_assessment_prompt(task, threshold)
-        local_raw = local_client.generate(local_prompt)
+
+        local_error = ""
+        try:
+            local_raw = local_client.generate(local_prompt)
+        except Exception as e:
+            local_raw = ""
+            local_error = str(e)
+
         assessment, error = parse_local_assessment(local_raw)
+        if local_error and not error:
+            error = local_error
 
         invalid_json = assessment is None
         if assessment is None:
             factual = is_factual_query(task) or is_authoritative_query(task)
             assessment = {
-                "final_answer": local_raw.strip(),
+                "final_answer": (local_raw or "").strip(),
                 "confidence": 0.0,
                 "escalate_to": "web" if factual else "api",
                 "search_query": "",
@@ -343,7 +351,11 @@ class Agent:
             }
 
         if general_mode == "local_only":
-            decision = {"route": "local", "reason": "local_only", "confidence": float(assessment.get("confidence", 0.0) or 0.0)}
+            decision = {
+                "route": "local",
+                "reason": "local_only",
+                "confidence": float(assessment.get("confidence", 0.0) or 0.0),
+            }
         else:
             decision = decide_general_route(
                 task=task,
@@ -368,10 +380,7 @@ class Agent:
             if general_mode == "local_only":
                 uncertainty = assessment.get("uncertainty_reasons") or []
                 if uncertainty or confidence < threshold:
-                    final_answer = (
-                        f"{final_answer}\n\n"
-                        "Note: Local response is uncertain."
-                    )
+                    final_answer = f"{final_answer}\n\nNote: Local response is uncertain."
             local_only_answer = True
             execution["llm"].append({"provider": "ollama_local", "success": True, "text": final_answer})
             routing_info = {
@@ -381,10 +390,11 @@ class Agent:
                 "providers_used": providers_used,
             }
             print(f"Route local conf={confidence:.2f}")
+
         elif route == "web":
             used_web = True
             authoritative = is_authoritative_query(task)
-            results = []
+            results: list[dict] = []
             status = "error"
             reason_detail = ""
             search_tool = ""
@@ -398,11 +408,11 @@ class Agent:
 
             def _log_search(tool_name: str, tool_status: str, detail: str, count: int) -> None:
                 if tool_status == "ok":
-                    print(f"WebSearch {tool_name}: ok query=\"{query}\" results={count}")
+                    print(f'WebSearch {tool_name}: ok query="{query}" results={count}')
                 elif tool_status in ("empty_results", "empty"):
                     print(f"WebSearch {tool_name}: empty")
                 else:
-                    print(f"WebSearch {tool_name}: error detail=\"{detail}\"")
+                    print(f'WebSearch {tool_name}: error detail="{detail}"')
 
             def _record_search(tool_name: str, tool_status: str, items: list[dict], detail: str) -> None:
                 providers_used.append(f"web_search_{tool_name}")
@@ -447,6 +457,7 @@ class Agent:
 
             evidence = summarize_evidence(results)
             web_weak = len(results) < 1
+
             if web_weak:
                 api_provider = self._best_available_api_provider()
                 if api_provider:
@@ -468,12 +479,34 @@ class Agent:
                     print(f"Route local->web tool={search_tool}")
             else:
                 synth_prompt = build_local_evidence_prompt(task, evidence)
-                final_answer = local_client.generate(synth_prompt)
-                execution["llm"].append({"provider": "ollama_local", "success": True, "text": final_answer})
-                if not any(r.get("url") and r.get("url") in final_answer for r in results):
-                    if results and results[0].get("url"):
-                        final_answer = f"{final_answer}\n\nSource: {results[0]['url']}"
-                print(f"Route local->web tool={search_tool}")
+                try:
+                    final_answer = local_client.generate(synth_prompt)
+                    execution["llm"].append({"provider": "ollama_local", "success": True, "text": final_answer})
+                    if not any(r.get("url") and r.get("url") in final_answer for r in results):
+                        if results and results[0].get("url"):
+                            final_answer = f"{final_answer}\n\nSource: {results[0]['url']}"
+                    print(f"Route local->web tool={search_tool}")
+                except Exception as e:
+                    api_provider = self._best_available_api_provider()
+                    if api_provider:
+                        used_api = True
+                        providers_used.append(api_provider)
+                        api_prompt = (
+                            "Role: assistant.\n"
+                            "Use the web evidence to answer the task.\n"
+                            "If evidence is weak or conflicting, say so.\n\n"
+                            f"Task:\n{task}\n\n"
+                            f"Web evidence:\n{evidence}\n"
+                        )
+                        text = self.provider_map[api_provider].generate(api_prompt)
+                        execution["llm"].append({"provider": api_provider, "success": True, "text": text})
+                        final_answer = text
+                        print(f"Route local->web->api (local synth failed) conf={confidence:.2f} err={e}")
+                    else:
+                        final_answer = (
+                            f"Local synthesis failed after web search; no API provider available. Error: {e}"
+                        )
+                        print(f"Route local->web (local synth failed) tool={search_tool} err={e}")
 
             routing_info = {
                 "route": "local->web->api" if used_api else "local->web",
@@ -483,6 +516,7 @@ class Agent:
                 "search_tool": search_tool,
                 "providers_used": providers_used,
             }
+
         elif route == "api":
             api_provider = self._best_available_api_provider()
             if api_provider:
@@ -507,6 +541,7 @@ class Agent:
                     "reason": "api_unavailable",
                     "providers_used": providers_used,
                 }
+
         else:
             final_answer = assessment.get("final_answer", "")
             routing_info = {
